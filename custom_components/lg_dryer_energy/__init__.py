@@ -36,7 +36,7 @@ from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models import StatisticData
 from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
-    get_last_statistics,
+    statistics_during_period,
 )
 from homeassistant.const import UnitOfEnergy
 from homeassistant.core import HomeAssistant, Event, callback
@@ -49,7 +49,17 @@ _LOGGER = logging.getLogger(__name__)
 DOMAIN = "lg_dryer_energy"
 STATISTIC_ID = f"{DOMAIN}:dryer_energy_attributed"
 STORAGE_KEY = f"{DOMAIN}.sessions"
-STORAGE_VERSION = 1
+STORAGE_VERSION = 2
+
+# Session retention window. Any session whose local end-date is strictly older
+# than `last_processed_local_date` is considered fully handled. Sessions whose
+# end-date is newer are preserved, capped by this outer window to prevent
+# unbounded growth if attribution stops running for a long time.
+SESSION_RETENTION_DAYS = 14
+
+# State values that must be treated as "no reading" rather than a numeric
+# transition. A flap into/out of these states is not a new event.
+_NON_NUMERIC_STATES = frozenset({"unknown", "unavailable", "none", ""})
 
 # Default configuration
 DEFAULT_STATUS_ENTITY = "sensor.dryer_current_status"
@@ -74,6 +84,20 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
 
     hass.data[DOMAIN] = tracker
     return True
+
+
+class _LgDryerStore(Store):
+    """Store subclass that migrates v1 -> v2 by adding last_processed_local_date."""
+
+    async def _async_migrate_func(
+        self,
+        old_major_version: int,
+        old_minor_version: int,
+        old_data: dict[str, Any],
+    ) -> dict[str, Any]:
+        if old_major_version < 2:
+            old_data.setdefault("last_processed_local_date", None)
+        return old_data
 
 
 class DryerSessionTracker:
@@ -101,26 +125,39 @@ class DryerSessionTracker:
         self.active_states = [s.lower() for s in active_states]
 
         # Persistent storage for sessions surviving restarts
-        self._store = Store(hass, STORAGE_VERSION, STORAGE_KEY)
+        self._store = _LgDryerStore(hass, STORAGE_VERSION, STORAGE_KEY)
         self._sessions: list[dict] = []  # {start: isoformat, end: isoformat|None}
         self._current_session_start: datetime | None = None
 
-        # Running sum for the external statistic
+        # Running sum kept only for diagnostic/backwards-compat purposes.
+        # The authoritative baseline is always re-derived from the
+        # statistics database at attribution time.
         self._cumulative_kwh: float = 0.0
+
+        # ISO-date (YYYY-MM-DD, local) of the last successfully attributed
+        # day. Used as the primary idempotency guard to prevent a duplicate
+        # attribution when energy_yesterday flaps through unknown/unavailable.
+        self._last_processed_local_date: str | None = None
 
     async def async_start(self) -> None:
         """Load persisted state and start listening."""
         stored = await self._store.async_load()
         if stored:
-            self._sessions = stored.get("sessions", [])
-            self._cumulative_kwh = stored.get("cumulative_kwh", 0.0)
+            self._sessions = stored.get("sessions", []) or []
+            self._cumulative_kwh = stored.get("cumulative_kwh", 0.0) or 0.0
             start_raw = stored.get("current_session_start")
             if start_raw:
                 self._current_session_start = datetime.fromisoformat(start_raw)
+            # v2 key: may be missing for storage files that predate the
+            # migration or were manually edited.
+            self._last_processed_local_date = stored.get(
+                "last_processed_local_date"
+            )
             _LOGGER.info(
-                "Loaded %d stored sessions, cumulative=%.3f kWh",
+                "Loaded %d stored sessions, cumulative=%.3f kWh, last_processed=%s",
                 len(self._sessions),
                 self._cumulative_kwh,
+                self._last_processed_local_date,
             )
 
         # If we missed the dryer starting while HA was down, check
@@ -177,29 +214,66 @@ class DryerSessionTracker:
 
     @callback
     def _async_on_energy_yesterday_change(self, event: Event) -> None:
-        """Handle energy_yesterday sensor update (morning push from LG cloud)."""
+        """Handle energy_yesterday sensor update (morning push from LG cloud).
+
+        LG ThinQ sensors routinely flap through `unknown` and `unavailable`.
+        A transition FROM one of those states BACK to the prior numeric value
+        is not a new event and must not trigger re-attribution. This was the
+        root cause of the duplicate-attribution bug: catching the ValueError
+        from float("unknown") and falling through into the write path.
+        """
         new_state = event.data.get("new_state")
         old_state = event.data.get("old_state")
 
         if new_state is None:
             return
 
+        new_raw = (new_state.state or "").lower()
+        if new_raw in _NON_NUMERIC_STATES:
+            _LOGGER.debug(
+                "energy_yesterday new_state is non-numeric (%s), ignoring",
+                new_raw,
+            )
+            return
+
+        # A transition OUT OF unknown/unavailable back to a previously-seen
+        # numeric value is not a new LG push. Reject it before touching the
+        # write path. The daily idempotency guard in _async_attribute_energy
+        # provides a second layer of defense.
+        if old_state is not None:
+            old_raw = (old_state.state or "").lower()
+            if old_raw in _NON_NUMERIC_STATES:
+                _LOGGER.debug(
+                    "energy_yesterday transitioned from %s back to numeric; "
+                    "treating as flap recovery, not a new event",
+                    old_raw,
+                )
+                return
+
         try:
             new_wh = float(new_state.state)
         except (ValueError, TypeError):
+            _LOGGER.debug(
+                "energy_yesterday new_state %r is not parseable as float",
+                new_state.state,
+            )
             return
 
         if new_wh <= 0:
             _LOGGER.debug("energy_yesterday is 0 or negative, skipping")
             return
 
-        # Avoid re-processing if the value hasn't actually changed
+        # Secondary numeric-equality guard. This is no longer the primary
+        # defense, but catches the case where both states are numeric and
+        # identical (e.g., a redundant state-write by the ThinQ integration).
         if old_state is not None:
             try:
-                old_wh = float(old_state.state)
-                if old_wh == new_wh:
+                if float(old_state.state) == new_wh:
                     return
             except (ValueError, TypeError):
+                # old_state was numeric-like but malformed. Continue to
+                # the daily idempotency check inside _async_attribute_energy
+                # rather than blindly reprocessing.
                 pass
 
         _LOGGER.info(
@@ -215,6 +289,11 @@ class DryerSessionTracker:
         """
         Distribute yesterday's total Wh across yesterday's dryer sessions,
         proportional to each session's duration, and inject into statistics.
+
+        Idempotent by local date: a repeated call for the same day is a no-op.
+        Baseline is re-derived each call from the statistics database as of
+        the moment yesterday began, so two calls for the same day produce
+        byte-identical StatisticData lists.
         """
         now = dt_util.utcnow()
         # "Yesterday" in local time
@@ -224,15 +303,34 @@ class DryerSessionTracker:
             - timedelta(days=1)
         )
         yesterday_end = yesterday_start + timedelta(days=1)
+        yesterday_date_iso = yesterday_start.date().isoformat()
+
+        # --- Fix #1: idempotency by local date -------------------------------
+        if self._last_processed_local_date == yesterday_date_iso:
+            _LOGGER.debug(
+                "Already processed %s, skipping duplicate attribution for %.0f Wh",
+                yesterday_date_iso,
+                total_wh,
+            )
+            return
 
         # Convert to UTC for comparison
         yesterday_start_utc = dt_util.as_utc(yesterday_start)
         yesterday_end_utc = dt_util.as_utc(yesterday_end)
 
-        # Find sessions that overlap with yesterday
+        # --- Fix #5: session bucketing / GC gap fix --------------------------
+        # A session is considered "yesterday's" if its end-date (local) equals
+        # yesterday_date_iso. A session is preserved for future attribution
+        # if its end-date (local) is strictly after yesterday_date_iso, OR if
+        # we have no last_processed_local_date yet and the session falls
+        # within the outer retention window. Sessions strictly older than
+        # yesterday are logged and dropped (they missed their attribution
+        # window, likely due to extended HA downtime).
+        retention_cutoff_utc = yesterday_start_utc - timedelta(
+            days=SESSION_RETENTION_DAYS
+        )
         yesterday_sessions: list[dict] = []
         remaining_sessions: list[dict] = []
-        cutoff_utc = yesterday_start_utc - timedelta(days=7)  # GC: drop old sessions
 
         for session in self._sessions:
             s_start = datetime.fromisoformat(session["start"])
@@ -240,16 +338,27 @@ class DryerSessionTracker:
             if s_end_raw:
                 s_end = datetime.fromisoformat(s_end_raw)
             else:
-                # Session still in progress (shouldn't happen for yesterday)
-                s_end = now
-
-            # Garbage collect sessions older than 7 days before yesterday
-            if s_end < cutoff_utc:
+                # Malformed / in-progress record in persisted storage.
+                # _current_session_start handles live in-progress sessions
+                # separately; drop this record to avoid ambiguity.
+                _LOGGER.warning(
+                    "Persisted session missing end timestamp, skipping: %r",
+                    session,
+                )
                 continue
 
-            # Does this session overlap with yesterday?
+            # Drop sessions beyond the outer retention window regardless.
+            if s_end < retention_cutoff_utc:
+                _LOGGER.warning(
+                    "Dropping session ending %s, older than %d-day retention "
+                    "window and never attributed",
+                    s_end.isoformat(),
+                    SESSION_RETENTION_DAYS,
+                )
+                continue
+
+            # Clip-overlap test against yesterday's local window.
             if s_start < yesterday_end_utc and s_end > yesterday_start_utc:
-                # Clip to yesterday's boundaries
                 clipped_start = max(s_start, yesterday_start_utc)
                 clipped_end = min(s_end, yesterday_end_utc)
                 yesterday_sessions.append(
@@ -260,9 +369,50 @@ class DryerSessionTracker:
                     }
                 )
 
-            # Keep sessions that end after yesterday (today's sessions, etc.)
-            if s_end >= yesterday_end_utc:
+            # Preserve any session that has content beyond yesterday. We keep
+            # the original unclipped record so midnight-crossing sessions are
+            # fully re-evaluable on the next attribution pass.
+            if s_end > yesterday_end_utc:
                 remaining_sessions.append(session)
+            elif s_end <= yesterday_start_utc:
+                # Session ended strictly before yesterday began. It has
+                # missed its attribution window (gap-day scenario). Log and
+                # drop so it can't silently accumulate.
+                _LOGGER.warning(
+                    "Session %s -> %s ended before yesterday began; "
+                    "never attributed (HA likely down on its attribution day)",
+                    session["start"],
+                    s_end_raw,
+                )
+
+        # --- Fix #6: include in-progress session starting before yesterday end
+        if (
+            self._current_session_start is not None
+            and self._current_session_start < yesterday_end_utc
+        ):
+            clipped_start = max(
+                self._current_session_start, yesterday_start_utc
+            )
+            clipped_end = yesterday_end_utc
+            duration = (clipped_end - clipped_start).total_seconds()
+            if duration > 0:
+                _LOGGER.info(
+                    "Including in-progress session (started %s) in yesterday's "
+                    "attribution (%.0f min pre-midnight)",
+                    self._current_session_start.isoformat(),
+                    duration / 60,
+                )
+                yesterday_sessions.append(
+                    {
+                        "start": clipped_start,
+                        "end": clipped_end,
+                        "duration": duration,
+                    }
+                )
+            # Do NOT modify self._current_session_start. The real session is
+            # still running; its post-midnight portion will be picked up on
+            # the next attribution pass (either from _sessions once closed,
+            # or from this same synthesis path if still running).
 
         if not yesterday_sessions:
             _LOGGER.warning(
@@ -324,20 +474,16 @@ class DryerSessionTracker:
 
                 hour_cursor = hour_end
 
-        # Get the current cumulative sum from last statistics entry
-        # This ensures continuity with previously injected data
-        last_stats = await get_instance(self.hass).async_add_executor_job(
-            get_last_statistics, self.hass, 1, STATISTIC_ID, True, {"sum"}
-        )
-
-        if last_stats and STATISTIC_ID in last_stats:
-            last_sum = last_stats[STATISTIC_ID][0].get("sum", 0.0) or 0.0
-        else:
-            last_sum = self._cumulative_kwh
+        # --- Fix #3: stable baseline from BEFORE the rewritten period --------
+        # Using get_last_statistics returns the newest row, which makes
+        # replays non-idempotent at the cumulative-sum level (a re-run would
+        # stack on top of its own prior output). Instead fetch the last
+        # statistic row at or immediately before yesterday began.
+        baseline_sum = await self._async_get_baseline_sum(yesterday_start_utc)
 
         # Build StatisticData rows sorted by hour
         statistics: list[StatisticData] = []
-        running_sum = last_sum
+        running_sum = baseline_sum
 
         for hour_ts in sorted(hourly_kwh.keys()):
             kwh_this_hour = hourly_kwh[hour_ts]
@@ -345,7 +491,9 @@ class DryerSessionTracker:
             statistics.append(
                 StatisticData(
                     start=hour_ts,
-                    state=running_sum,
+                    # Fix #7: per-hour delta is the correct `state` for a
+                    # has_sum=True series. `sum` is the cumulative.
+                    state=kwh_this_hour,
                     sum=running_sum,
                 )
             )
@@ -366,17 +514,69 @@ class DryerSessionTracker:
             "unit_of_measurement": UnitOfEnergy.KILO_WATT_HOUR,
         }
 
+        # --- Fix #4: mutate state only on successful write -------------------
+        # async_add_external_statistics is a synchronous callback; if it
+        # raises, none of the state below is touched and the next invocation
+        # can retry cleanly.
         async_add_external_statistics(self.hass, metadata, statistics)
+
         _LOGGER.info(
-            "Injected %d hourly statistics rows (%.3f kWh total for yesterday)",
+            "Injected %d hourly statistics rows (%.3f kWh total for %s)",
             len(statistics),
             total_kwh,
+            yesterday_date_iso,
         )
 
-        # Update our running total and clean up old sessions
-        self._cumulative_kwh = running_sum
         self._sessions = remaining_sessions
+        self._cumulative_kwh = running_sum
+        self._last_processed_local_date = yesterday_date_iso
         await self._async_save()
+
+    async def _async_get_baseline_sum(
+        self, yesterday_start_utc: datetime
+    ) -> float:
+        """Return the cumulative `sum` of our statistic as of yesterday_start_utc.
+
+        Querying a window ending AT yesterday_start_utc and taking the last
+        row gives us the baseline that existed before yesterday began. This
+        makes the attribution idempotent: re-running for the same day with
+        the same inputs yields identical StatisticData.
+        """
+        window_start = yesterday_start_utc - timedelta(days=8)
+        try:
+            rows = await get_instance(self.hass).async_add_executor_job(
+                statistics_during_period,
+                self.hass,
+                window_start,
+                yesterday_start_utc,
+                {STATISTIC_ID},
+                "hour",
+                None,
+                {"sum"},
+            )
+        except Exception:  # noqa: BLE001 - defensive, API shape varies by HA version
+            _LOGGER.exception(
+                "statistics_during_period failed; defaulting baseline to 0.0"
+            )
+            rows = {}
+
+        series = rows.get(STATISTIC_ID) if rows else None
+        if series:
+            last_row = series[-1]
+            baseline = last_row.get("sum")
+            if baseline is not None:
+                _LOGGER.debug(
+                    "Baseline sum=%.4f from stat row at %s (before yesterday)",
+                    baseline,
+                    last_row.get("start"),
+                )
+                return float(baseline)
+
+        _LOGGER.debug(
+            "No prior stat row before %s; baseline defaults to 0.0",
+            yesterday_start_utc.isoformat(),
+        )
+        return 0.0
 
     async def _async_save(self) -> None:
         """Persist session data and cumulative total."""
@@ -389,5 +589,6 @@ class DryerSessionTracker:
                     if self._current_session_start
                     else None
                 ),
+                "last_processed_local_date": self._last_processed_local_date,
             }
         )
