@@ -318,14 +318,26 @@ class DryerSessionTracker:
         yesterday_start_utc = dt_util.as_utc(yesterday_start)
         yesterday_end_utc = dt_util.as_utc(yesterday_end)
 
-        # --- Fix #5: session bucketing / GC gap fix --------------------------
-        # A session is considered "yesterday's" if its end-date (local) equals
-        # yesterday_date_iso. A session is preserved for future attribution
-        # if its end-date (local) is strictly after yesterday_date_iso, OR if
-        # we have no last_processed_local_date yet and the session falls
-        # within the outer retention window. Sessions strictly older than
-        # yesterday are logged and dropped (they missed their attribution
-        # window, likely due to extended HA downtime).
+        # --- Fix #8: attribute by session end-date (LG's model) --------------
+        # Empirically verified (April 2026): LG reports each cycle's energy
+        # under the local date the cycle ENDED on, not the date it started.
+        # A cycle running 23:27 local D-1 -> 00:19 local D shows up as 0 on
+        # D-1 and as the full cycle energy on D.
+        #
+        # Therefore: a session belongs to yesterday's attribution if and only
+        # if its end timestamp, converted to local time, falls on
+        # yesterday_date_iso. We use the session's FULL unclipped duration for
+        # proportional splitting, and when laying down hourly rows we allow
+        # them to fall on date D-1 (the day before yesterday) for the
+        # pre-midnight portion of an overnight cycle. Those rows are real
+        # energy use and are correct even though LG's D-1 daily total is 0.
+        #
+        # A session whose end-local-date is AFTER yesterday (typically today,
+        # for a cycle that crossed midnight into today) is preserved for its
+        # own future attribution pass. A session whose end-local-date is
+        # strictly BEFORE yesterday has missed its window and is logged and
+        # dropped.
+        yesterday_local_date = yesterday_start.date()
         retention_cutoff_utc = yesterday_start_utc - timedelta(
             days=SESSION_RETENTION_DAYS
         )
@@ -335,84 +347,59 @@ class DryerSessionTracker:
         for session in self._sessions:
             s_start = datetime.fromisoformat(session["start"])
             s_end_raw = session.get("end")
-            if s_end_raw:
-                s_end = datetime.fromisoformat(s_end_raw)
-            else:
-                # Malformed / in-progress record in persisted storage.
-                # _current_session_start handles live in-progress sessions
-                # separately; drop this record to avoid ambiguity.
+            if not s_end_raw:
                 _LOGGER.warning(
                     "Persisted session missing end timestamp, skipping: %r",
                     session,
                 )
                 continue
+            s_end = datetime.fromisoformat(s_end_raw)
+            if s_start.tzinfo is None:
+                s_start = s_start.replace(tzinfo=timezone.utc)
+            if s_end.tzinfo is None:
+                s_end = s_end.replace(tzinfo=timezone.utc)
 
-            # Drop sessions beyond the outer retention window regardless.
-            if s_end < retention_cutoff_utc:
-                _LOGGER.warning(
-                    "Dropping session ending %s, older than %d-day retention "
-                    "window and never attributed",
-                    s_end.isoformat(),
-                    SESSION_RETENTION_DAYS,
-                )
-                continue
+            end_local_date = dt_util.as_local(s_end).date()
 
-            # Clip-overlap test against yesterday's local window.
-            if s_start < yesterday_end_utc and s_end > yesterday_start_utc:
-                clipped_start = max(s_start, yesterday_start_utc)
-                clipped_end = min(s_end, yesterday_end_utc)
+            if end_local_date == yesterday_local_date:
+                # Belongs to this attribution pass. Use full duration.
                 yesterday_sessions.append(
                     {
-                        "start": clipped_start,
-                        "end": clipped_end,
-                        "duration": (clipped_end - clipped_start).total_seconds(),
+                        "start": s_start,
+                        "end": s_end,
+                        "duration": (s_end - s_start).total_seconds(),
                     }
                 )
-
-            # Preserve any session that has content beyond yesterday. We keep
-            # the original unclipped record so midnight-crossing sessions are
-            # fully re-evaluable on the next attribution pass.
-            if s_end > yesterday_end_utc:
+            elif end_local_date > yesterday_local_date:
+                # Ended on today (or later, if clock skew). Preserve for a
+                # future attribution pass once LG reports it.
                 remaining_sessions.append(session)
-            elif s_end <= yesterday_start_utc:
-                # Session ended strictly before yesterday began. It has
-                # missed its attribution window (gap-day scenario). Log and
-                # drop so it can't silently accumulate.
-                _LOGGER.warning(
-                    "Session %s -> %s ended before yesterday began; "
-                    "never attributed (HA likely down on its attribution day)",
-                    session["start"],
-                    s_end_raw,
-                )
+            else:
+                # end_local_date < yesterday: session's attribution day has
+                # already passed. Drop with appropriate logging.
+                if s_end < retention_cutoff_utc:
+                    _LOGGER.warning(
+                        "Dropping session ending %s, older than %d-day "
+                        "retention window and never attributed",
+                        s_end.isoformat(),
+                        SESSION_RETENTION_DAYS,
+                    )
+                else:
+                    _LOGGER.warning(
+                        "Session %s -> %s ended on local date %s which is "
+                        "older than yesterday (%s); never attributed (HA "
+                        "likely down on its attribution day)",
+                        session["start"],
+                        s_end_raw,
+                        end_local_date.isoformat(),
+                        yesterday_date_iso,
+                    )
 
-        # --- Fix #6: include in-progress session starting before yesterday end
-        if (
-            self._current_session_start is not None
-            and self._current_session_start < yesterday_end_utc
-        ):
-            clipped_start = max(
-                self._current_session_start, yesterday_start_utc
-            )
-            clipped_end = yesterday_end_utc
-            duration = (clipped_end - clipped_start).total_seconds()
-            if duration > 0:
-                _LOGGER.info(
-                    "Including in-progress session (started %s) in yesterday's "
-                    "attribution (%.0f min pre-midnight)",
-                    self._current_session_start.isoformat(),
-                    duration / 60,
-                )
-                yesterday_sessions.append(
-                    {
-                        "start": clipped_start,
-                        "end": clipped_end,
-                        "duration": duration,
-                    }
-                )
-            # Do NOT modify self._current_session_start. The real session is
-            # still running; its post-midnight portion will be picked up on
-            # the next attribution pass (either from _sessions once closed,
-            # or from this same synthesis path if still running).
+        # A session that is still in progress (self._current_session_start set,
+        # no end recorded) cannot be attributed yet: LG only reports energy
+        # after a cycle completes. Do NOT synthesize a partial session into
+        # yesterday's attribution; it will be picked up once the cycle ends
+        # and energy_yesterday fires for its local end-date.
 
         if not yesterday_sessions:
             _LOGGER.warning(
@@ -474,12 +461,17 @@ class DryerSessionTracker:
 
                 hour_cursor = hour_end
 
-        # --- Fix #3: stable baseline from BEFORE the rewritten period --------
-        # Using get_last_statistics returns the newest row, which makes
-        # replays non-idempotent at the cumulative-sum level (a re-run would
-        # stack on top of its own prior output). Instead fetch the last
-        # statistic row at or immediately before yesterday began.
-        baseline_sum = await self._async_get_baseline_sum(yesterday_start_utc)
+        # --- Fix #3/#8: stable baseline from BEFORE the earliest written hour
+        # Under the end-date model, an overnight cycle may write an hour that
+        # falls on date D-1 (the day before yesterday). The baseline must be
+        # fetched strictly before the earliest hour we're about to write, not
+        # merely before yesterday_start, so the cumulative sum remains
+        # monotonic and replay-idempotent.
+        if hourly_kwh:
+            earliest_hour_utc = min(hourly_kwh.keys())
+        else:
+            earliest_hour_utc = yesterday_start_utc
+        baseline_sum = await self._async_get_baseline_sum(earliest_hour_utc)
 
         # Build StatisticData rows sorted by hour
         statistics: list[StatisticData] = []
@@ -533,22 +525,22 @@ class DryerSessionTracker:
         await self._async_save()
 
     async def _async_get_baseline_sum(
-        self, yesterday_start_utc: datetime
+        self, before_utc: datetime
     ) -> float:
-        """Return the cumulative `sum` of our statistic as of yesterday_start_utc.
+        """Return the cumulative `sum` of our statistic as of `before_utc`.
 
-        Querying a window ending AT yesterday_start_utc and taking the last
-        row gives us the baseline that existed before yesterday began. This
-        makes the attribution idempotent: re-running for the same day with
-        the same inputs yields identical StatisticData.
+        Fetches the newest statistic row strictly before `before_utc`. Used
+        to derive a stable baseline so the attribution is idempotent: running
+        twice with the same inputs yields identical StatisticData lists, and
+        cumulative sums remain monotonic across backdated writes.
         """
-        window_start = yesterday_start_utc - timedelta(days=8)
+        window_start = before_utc - timedelta(days=8)
         try:
             rows = await get_instance(self.hass).async_add_executor_job(
                 statistics_during_period,
                 self.hass,
                 window_start,
-                yesterday_start_utc,
+                before_utc,
                 {STATISTIC_ID},
                 "hour",
                 None,
@@ -566,15 +558,16 @@ class DryerSessionTracker:
             baseline = last_row.get("sum")
             if baseline is not None:
                 _LOGGER.debug(
-                    "Baseline sum=%.4f from stat row at %s (before yesterday)",
+                    "Baseline sum=%.4f from stat row at %s (before %s)",
                     baseline,
                     last_row.get("start"),
+                    before_utc.isoformat(),
                 )
                 return float(baseline)
 
         _LOGGER.debug(
             "No prior stat row before %s; baseline defaults to 0.0",
-            yesterday_start_utc.isoformat(),
+            before_utc.isoformat(),
         )
         return 0.0
 

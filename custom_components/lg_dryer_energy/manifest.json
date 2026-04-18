@@ -2,7 +2,7 @@
   "domain": "lg_dryer_energy",
   "name": "LG Dryer Energy Attribution",
   "documentation": "https://github.com/aalkon/lg_dryer_energy",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "codeowners": [],
   "dependencies": ["recorder"],
   "iot_class": "local_polling",

@@ -161,12 +161,13 @@ If Home Assistant was down when the dryer started, the integration checks the cu
 
 When `energy_yesterday` changes to a positive value (the LG cloud morning push — timing varies by region):
 
-1. Find all recorded sessions that overlap with "yesterday" (midnight to midnight, local time)
-2. Clip sessions to yesterday's boundaries (a session spanning midnight gets split across days)
-3. Calculate each session's share of total energy: `session_kwh = total_kwh × (session_duration / total_duration)`
-4. For sessions spanning multiple hours, further split proportionally across hour boundaries
-5. Read the last cumulative sum from HA's statistics database for continuity
-6. Inject `StatisticData` rows via `async_add_external_statistics`, each with the correct backdated `start` timestamp and a monotonically increasing `sum`
+1. Find all recorded sessions whose **end timestamp falls on yesterday's local date**. LG attributes a cycle's energy to the day the cycle ended on, not the day it started, so this is the set of sessions yesterday's reported kWh covers.
+2. Calculate each session's share of total energy using its **full unclipped duration**: `session_kwh = total_kwh × (session_duration / total_duration)`
+3. For sessions spanning multiple hours, further split proportionally across hour boundaries. For an overnight cycle, this means some hourly rows will be written to the day before yesterday — those represent real pre-midnight energy use and are correct.
+4. Read the cumulative-sum baseline from HA's statistics database as of the earliest hour about to be written, so the injected rows slot in with a monotonically increasing `sum`.
+5. Inject `StatisticData` rows via `async_add_external_statistics`, each with the correct backdated `start` timestamp.
+
+A session whose end-date is AFTER yesterday (typically today, for a cycle that crossed midnight into today) is preserved in storage and attributed on a future pass when LG reports its energy.
 
 ### Fallback Behavior
 
@@ -178,11 +179,15 @@ LG ThinQ sensors routinely flap through `unknown` and `unavailable`. The integra
 
 1. Transitions from `unknown`/`unavailable` back to a numeric value are ignored — these are not new cloud pushes.
 2. Attribution is keyed by local date (`last_processed_local_date` in `.storage/lg_dryer_energy.sessions`). A second call for the same day is a no-op.
-3. The cumulative-sum baseline is re-read from the statistics database as of the moment yesterday began (not from the latest row), so even a forced replay produces identical rows and cannot create non-monotonic sums or compensating negative bars in the Energy Dashboard.
+3. The cumulative-sum baseline is re-read from the statistics database as of the earliest hour about to be written (not from the latest row), so even a forced replay produces identical rows and cannot create non-monotonic sums or compensating negative bars in the Energy Dashboard.
 
-### Known Imprecision: Overnight Cycles
+### Overnight Cycles & Daily-Total Mismatch with the LG App
 
-If a cycle runs past midnight (e.g., 11 PM → 1 AM), this integration splits the energy proportionally by clipped duration across both days. LG's own daily totals may attribute the full cycle to one day or the other rather than splitting. The daily sums will therefore agree on days without midnight crossings but may disagree on days with one, typically by at most the energy of a single partial cycle. If you need exact agreement with LG's reported daily totals, this is a limitation to be aware of.
+If a cycle crosses midnight (e.g., 11:27 PM → 12:19 AM), LG reports the entire cycle's energy under the day the cycle **ended on**; the start-day shows 0. This integration matches LG's attribution (the full kWh is assigned to the end-day) but then distributes the hourly rows across the hours the cycle actually ran, which means some rows land on the previous calendar day.
+
+**Consequence:** for any day with an overnight cycle, the Energy Dashboard's daily total for that day will not exactly equal the LG app's daily total for the same day. The start-day shows some kWh (the pre-midnight hours) even though LG's start-day total is 0; the end-day shows less than LG's total. Summed across both days, the two systems agree.
+
+This is a deliberate tradeoff. The point of this integration is correct time-of-use tracking — if you run the dryer at 11:30 PM, the 11 PM hour should show energy use, not a 0 followed by a spike at midnight. If you need exact daily agreement with the LG app, look at the app directly; the Energy Dashboard is optimized for hour-of-use fidelity.
 
 ### Data Persistence
 
