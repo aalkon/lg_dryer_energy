@@ -165,8 +165,28 @@ class DryerSessionTracker:
         state = self.hass.states.get(self.status_entity)
         if state and state.state.lower() in self.active_states:
             if self._current_session_start is None:
-                self._current_session_start = dt_util.utcnow()
-                _LOGGER.info("Dryer already active on startup, recording session start")
+                # --- Fix #9: reconstruct true session start from recorder ---
+                # The dominant cause of truncated session attribution is
+                # "HA restarted mid-cycle". Defaulting to utcnow() here
+                # erases the pre-restart portion of the active run. Walk
+                # backward through recorder history to find the earliest
+                # contiguous active state and use its timestamp as the
+                # true session start. Fall back to utcnow() only when
+                # history is unavailable or inconclusive.
+                reconstructed = await self._async_reconstruct_session_start()
+                if reconstructed is not None:
+                    self._current_session_start = reconstructed
+                    _LOGGER.info(
+                        "Dryer already active on startup; reconstructed "
+                        "session start from recorder history: %s",
+                        reconstructed.isoformat(),
+                    )
+                else:
+                    self._current_session_start = dt_util.utcnow()
+                    _LOGGER.info(
+                        "Dryer already active on startup; recorder history "
+                        "unavailable or empty, using current time as session start"
+                    )
 
         # Listen for status changes (session start/end)
         async_track_state_change_event(
@@ -523,6 +543,92 @@ class DryerSessionTracker:
         self._cumulative_kwh = running_sum
         self._last_processed_local_date = yesterday_date_iso
         await self._async_save()
+
+    async def _async_reconstruct_session_start(self) -> datetime | None:
+        """Reconstruct the true session start from recorder history.
+
+        Called on startup when the status entity is already in an active
+        state. Walks backward through the most recent state changes and
+        returns the `last_changed` timestamp of the earliest state in the
+        current contiguous run of active states. Returns None if the
+        recorder history module is unavailable, the query fails, the
+        result is empty, or the most recent recorded state is not active
+        (in which case the current liveness is a post-restart restore and
+        we cannot trust history to establish a true start).
+        """
+        try:
+            from homeassistant.components.recorder import (  # noqa: WPS433
+                history as recorder_history,
+            )
+        except ImportError:
+            _LOGGER.debug(
+                "Recorder history module unavailable; cannot reconstruct "
+                "session start from history"
+            )
+            return None
+
+        get_last_state_changes = getattr(
+            recorder_history, "get_last_state_changes", None
+        )
+        if get_last_state_changes is None:
+            _LOGGER.debug(
+                "get_last_state_changes not present on recorder.history; "
+                "cannot reconstruct session start"
+            )
+            return None
+
+        try:
+            changes = await get_instance(self.hass).async_add_executor_job(
+                get_last_state_changes,
+                self.hass,
+                20,
+                self.status_entity,
+            )
+        except Exception:  # noqa: BLE001 - defensive across HA versions
+            _LOGGER.exception(
+                "get_last_state_changes failed; cannot reconstruct session start"
+            )
+            return None
+
+        states = (changes or {}).get(self.status_entity) or []
+        if not states:
+            return None
+
+        def _ts(s: Any) -> datetime | None:
+            return getattr(s, "last_changed", None) or getattr(
+                s, "last_updated", None
+            )
+
+        # Order ascending by timestamp so the last element is the most recent.
+        try:
+            ordered = sorted(
+                (s for s in states if _ts(s) is not None),
+                key=_ts,
+            )
+        except TypeError:
+            ordered = list(states)
+
+        if not ordered:
+            return None
+
+        latest = ordered[-1]
+        latest_val = (getattr(latest, "state", "") or "").lower()
+        if latest_val not in self.active_states:
+            # The most recent recorded state is not active; cannot
+            # confidently locate the current run from history.
+            return None
+
+        earliest_active_ts: datetime | None = _ts(latest)
+        for s in reversed(ordered[:-1]):
+            val = (getattr(s, "state", "") or "").lower()
+            if val in self.active_states:
+                ts = _ts(s)
+                if ts is not None:
+                    earliest_active_ts = ts
+            else:
+                break
+
+        return earliest_active_ts
 
     async def _async_get_baseline_sum(
         self, before_utc: datetime

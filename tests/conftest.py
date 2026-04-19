@@ -176,6 +176,19 @@ _rec_stats_mod.async_add_external_statistics = _default_add_external_statistics
 _rec_stats_mod.statistics_during_period = _default_statistics_during_period
 
 
+# ---- homeassistant.components.recorder.history ----------------------------
+_rec_history_mod = _ensure_module("homeassistant.components.recorder.history")
+
+
+def _default_get_last_state_changes(hass, number_of_states, entity_id):
+    """Default stub: return the configured rows keyed by entity_id."""
+    return dict(_rec_history_mod._history_rows)
+
+
+_rec_history_mod._history_rows = {}
+_rec_history_mod.get_last_state_changes = _default_get_last_state_changes
+
+
 # --- pytest fixtures --------------------------------------------------------
 import pytest  # noqa: E402
 

@@ -460,3 +460,72 @@ async def test_non_monotonic_sum_never_occurs_on_replay(
             "Non-monotonic cumulative sum detected; replay stacked onto "
             "its own prior output (this is the original bug)."
         )
+
+
+@pytest.mark.asyncio
+async def test_11_session_resume_from_history_across_restart(
+    reset_stat_state, local_tz_utc, monkeypatch
+):
+    """
+    HA restarted mid-cycle. On startup the dryer is observed as 'running',
+    but recorder history shows the run actually began at T1, with an
+    earlier non-active state at T0. async_start must walk backward through
+    get_last_state_changes and set _current_session_start to T1, NOT to
+    utcnow(). This is the dominant cause of truncated session attribution.
+    """
+    # Freeze utcnow() well AFTER T2 so any fallback to utcnow() would be
+    # trivially distinguishable from the expected T1 value.
+    T0 = datetime(2026, 4, 19, 14, 0, 0, tzinfo=timezone.utc)   # 'initial'
+    T1 = datetime(2026, 4, 19, 14, 12, 0, tzinfo=timezone.utc)  # 'running' (true start)
+    T2 = datetime(2026, 4, 19, 14, 25, 0, tzinfo=timezone.utc)  # 'running' (post-restart)
+    now_after_restart = datetime(2026, 4, 19, 14, 30, 0, tzinfo=timezone.utc)
+    _freeze_now(monkeypatch, now_after_restart)
+
+    # Install a mock get_last_state_changes that returns a contiguous run
+    # of active states back to T1 preceded by a non-active state at T0.
+    import homeassistant.components.recorder.history as rec_history
+
+    state_entity = "sensor.dryer_current_status"
+
+    def _mk(state_val: str, ts: datetime):
+        return SimpleNamespace(state=state_val, last_changed=ts, last_updated=ts)
+
+    history_payload = {
+        state_entity: [
+            _mk("initial", T0),
+            _mk("running", T1),
+            _mk("running", T2),
+        ]
+    }
+    calls: list = []
+
+    def _mock_get_last_state_changes(hass, number_of_states, entity_id):
+        calls.append((number_of_states, entity_id))
+        return history_payload
+
+    monkeypatch.setattr(
+        rec_history, "get_last_state_changes", _mock_get_last_state_changes
+    )
+
+    # Build a hass with states.get returning the currently-running state.
+    hass = MagicMock()
+    hass.states.get.return_value = SimpleNamespace(state="running")
+
+    tracker = ldy.DryerSessionTracker(
+        hass,
+        status_entity=state_entity,
+        energy_yesterday_entity="sensor.dryer_energy_yesterday",
+        active_states=["running", "cooling"],
+    )
+
+    await tracker.async_start()
+
+    # The reconstruction path must have been used.
+    assert calls, "get_last_state_changes was never called on startup"
+    assert tracker._current_session_start == T1, (
+        f"Expected session start reconstructed to T1={T1.isoformat()}, "
+        f"got {tracker._current_session_start}"
+    )
+    assert tracker._current_session_start != now_after_restart, (
+        "Session start fell through to utcnow(); history reconstruction failed."
+    )
