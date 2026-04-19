@@ -65,6 +65,8 @@ _NON_NUMERIC_STATES = frozenset({"unknown", "unavailable", "none", ""})
 DEFAULT_STATUS_ENTITY = "sensor.dryer_current_status"
 DEFAULT_ENERGY_YESTERDAY_ENTITY = "sensor.dryer_energy_yesterday"
 DEFAULT_ACTIVE_STATES = ["running", "cooling"]
+DEFAULT_TOTAL_TIME_ENTITY = "sensor.dryer_total_time"
+DEFAULT_REMAINING_TIME_ENTITY = "sensor.dryer_remaining_time"
 
 
 async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
@@ -76,9 +78,20 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         "energy_yesterday_entity", DEFAULT_ENERGY_YESTERDAY_ENTITY
     )
     active_states = conf.get("active_states", DEFAULT_ACTIVE_STATES)
+    total_time_entity = conf.get(
+        "total_time_entity", DEFAULT_TOTAL_TIME_ENTITY
+    )
+    remaining_time_entity = conf.get(
+        "remaining_time_entity", DEFAULT_REMAINING_TIME_ENTITY
+    )
 
     tracker = DryerSessionTracker(
-        hass, status_entity, energy_yesterday_entity, active_states
+        hass,
+        status_entity,
+        energy_yesterday_entity,
+        active_states,
+        total_time_entity=total_time_entity,
+        remaining_time_entity=remaining_time_entity,
     )
     await tracker.async_start()
 
@@ -118,11 +131,15 @@ class DryerSessionTracker:
         status_entity: str,
         energy_yesterday_entity: str,
         active_states: list[str],
+        total_time_entity: str = DEFAULT_TOTAL_TIME_ENTITY,
+        remaining_time_entity: str = DEFAULT_REMAINING_TIME_ENTITY,
     ) -> None:
         self.hass = hass
         self.status_entity = status_entity
         self.energy_yesterday_entity = energy_yesterday_entity
         self.active_states = [s.lower() for s in active_states]
+        self.total_time_entity = total_time_entity
+        self.remaining_time_entity = remaining_time_entity
 
         # Persistent storage for sessions surviving restarts
         self._store = _LgDryerStore(hass, STORAGE_VERSION, STORAGE_KEY)
@@ -165,28 +182,34 @@ class DryerSessionTracker:
         state = self.hass.states.get(self.status_entity)
         if state and state.state.lower() in self.active_states:
             if self._current_session_start is None:
-                # --- Fix #9: reconstruct true session start from recorder ---
+                # --- Three-tier session-start reconstruction ---
                 # The dominant cause of truncated session attribution is
-                # "HA restarted mid-cycle". Defaulting to utcnow() here
-                # erases the pre-restart portion of the active run. Walk
-                # backward through recorder history to find the earliest
-                # contiguous active state and use its timestamp as the
-                # true session start. Fall back to utcnow() only when
-                # history is unavailable or inconclusive.
-                reconstructed = await self._async_reconstruct_session_start()
-                if reconstructed is not None:
-                    self._current_session_start = reconstructed
-                    _LOGGER.info(
-                        "Dryer already active on startup; reconstructed "
-                        "session start from recorder history: %s",
-                        reconstructed.isoformat(),
-                    )
-                else:
-                    self._current_session_start = dt_util.utcnow()
-                    _LOGGER.info(
-                        "Dryer already active on startup; recorder history "
-                        "unavailable or empty, using current time as session start"
-                    )
+                # "HA restarted mid-cycle" (or HA was down when the cycle
+                # began). Defaulting to utcnow() here erases the pre-restart
+                # portion of the active run. Resolution order:
+                #   1. LG total_time/remaining_time sensors (robust to HA
+                #      downtime and recorder purges).
+                #   2. Recorder state history walk.
+                #   3. utcnow() as last-resort fallback.
+                now = dt_util.utcnow()
+
+                reconstructed = self._resume_from_lg_sensors(now)
+                source = "lg_sensors"
+
+                if reconstructed is None:
+                    reconstructed = await self._async_reconstruct_session_start()
+                    source = "history_walk"
+
+                if reconstructed is None:
+                    reconstructed = now
+                    source = "utcnow_fallback"
+
+                self._current_session_start = reconstructed
+                _LOGGER.info(
+                    "Dryer already active on startup; session start=%s (source=%s)",
+                    reconstructed.isoformat(),
+                    source,
+                )
 
         # Listen for status changes (session start/end)
         async_track_state_change_event(
@@ -543,6 +566,53 @@ class DryerSessionTracker:
         self._cumulative_kwh = running_sum
         self._last_processed_local_date = yesterday_date_iso
         await self._async_save()
+
+    def _resume_from_lg_sensors(self, now: datetime) -> datetime | None:
+        """Reconstruct session start from LG's total_time and remaining_time sensors.
+
+        These sensors reflect the dryer's internal cycle clock and survive HA
+        restarts and recorder purges. Returns the reconstructed start, or None
+        if the sensors are unavailable, non-numeric, inconsistent, or in the
+        cooling phase (where remaining_time is 0 but cooling time is not counted
+        in total_time, making the derived elapsed incorrect).
+        """
+        total_state = self.hass.states.get(self.total_time_entity)
+        remaining_state = self.hass.states.get(self.remaining_time_entity)
+        if not total_state or not remaining_state:
+            return None
+
+        total_raw = (total_state.state or "").lower()
+        remaining_raw = (remaining_state.state or "").lower()
+        if total_raw in _NON_NUMERIC_STATES or remaining_raw in _NON_NUMERIC_STATES:
+            return None
+
+        try:
+            total_min = float(total_state.state)
+            remaining_min = float(remaining_state.state)
+        except (ValueError, TypeError):
+            return None
+
+        # Sanity: remaining cannot exceed total, and total must be positive.
+        if total_min <= 0 or remaining_min < 0 or remaining_min > total_min:
+            return None
+
+        # During cooling, LG typically reports remaining_time == 0 while the
+        # dryer is still in an active state. But total_time is the programmed
+        # cycle length excluding cooling, so (total - 0) is NOT the real
+        # elapsed. Skip this tier in cooling and let the history walk handle it.
+        status_state = self.hass.states.get(self.status_entity)
+        if (
+            status_state
+            and (status_state.state or "").lower() == "cooling"
+            and remaining_min == 0
+        ):
+            return None
+
+        elapsed_min = total_min - remaining_min
+        if elapsed_min <= 0 or elapsed_min > 24 * 60:
+            return None
+
+        return now - timedelta(minutes=elapsed_min)
 
     async def _async_reconstruct_session_start(self) -> datetime | None:
         """Reconstruct the true session start from recorder history.

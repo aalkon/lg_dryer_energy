@@ -139,6 +139,8 @@ This step can only be completed after the first data point has been injected —
 | `status_entity` | `sensor.dryer_current_status` | Entity that reports dryer state (running, cooling, etc.) |
 | `energy_yesterday_entity` | `sensor.dryer_energy_yesterday` | Entity that reports yesterday's total energy in Wh |
 | `active_states` | `["running", "cooling"]` | Which states count as "dryer is consuming energy" |
+| `total_time_entity` | `sensor.dryer_total_time` | LG sensor reporting programmed cycle length (minutes). Used to reconstruct true cycle start if HA restarts mid-cycle. |
+| `remaining_time_entity` | `sensor.dryer_remaining_time` | LG sensor reporting time remaining (minutes). Used with `total_time_entity` above. |
 
 ### Entity name differences
 
@@ -155,7 +157,7 @@ Update the configuration to match your actual entity IDs.
 
 The integration listens for state changes on the status entity. A "session" starts when the state enters any of the `active_states` and ends when it leaves. Sessions are persisted to `.storage/lg_dryer_energy.sessions` so they survive Home Assistant restarts.
 
-If Home Assistant was down when the dryer started, the integration checks the current state on startup and begins a new session from that moment. You'll lose the minutes between the actual dryer start and HA coming back online, but the proportional attribution still works correctly since all tracked sessions are scaled to fill the full daily energy total.
+If Home Assistant was down when the dryer started, or HA restarts mid-cycle, the integration reconstructs the true session start from (in order): LG's `total_time` / `remaining_time` sensors, recorder state history, or the current time as a last resort. In the common case — an HA restart during a cycle — this fully recovers the pre-restart portion of the session, so per-cycle attribution remains accurate.
 
 ### Energy Attribution
 

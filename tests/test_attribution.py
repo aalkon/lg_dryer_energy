@@ -529,3 +529,177 @@ async def test_11_session_resume_from_history_across_restart(
     assert tracker._current_session_start != now_after_restart, (
         "Session start fell through to utcnow(); history reconstruction failed."
     )
+
+
+@pytest.mark.asyncio
+async def test_12_session_resume_from_lg_sensors(monkeypatch, local_tz_utc):
+    """LG sensors report total=60, remaining=15 -> start reconstructed at now - 45 min."""
+    now = datetime(2026, 4, 19, 14, 30, tzinfo=timezone.utc)
+    _freeze_now(monkeypatch, now)
+
+    hass = MagicMock()
+
+    def _get(eid: str):
+        return {
+            "sensor.dryer_current_status": SimpleNamespace(state="running"),
+            "sensor.dryer_total_time": SimpleNamespace(state="60"),
+            "sensor.dryer_remaining_time": SimpleNamespace(state="15"),
+        }.get(eid)
+
+    hass.states.get.side_effect = _get
+
+    tracker = ldy.DryerSessionTracker(
+        hass,
+        status_entity="sensor.dryer_current_status",
+        energy_yesterday_entity="sensor.dryer_energy_yesterday",
+        active_states=["running", "cooling"],
+    )
+    tracker.total_time_entity = "sensor.dryer_total_time"
+    tracker.remaining_time_entity = "sensor.dryer_remaining_time"
+
+    await tracker.async_start()
+
+    expected = now - timedelta(minutes=45)
+    assert tracker._current_session_start == expected
+
+
+@pytest.mark.asyncio
+async def test_13_lg_sensor_resume_skipped_during_cooling(monkeypatch, local_tz_utc):
+    """During cooling with remaining=0, tier 1 must return None."""
+    now = datetime(2026, 4, 19, 14, 30, tzinfo=timezone.utc)
+    _freeze_now(monkeypatch, now)
+
+    hass = MagicMock()
+
+    def _get(eid: str):
+        return {
+            "sensor.dryer_current_status": SimpleNamespace(state="cooling"),
+            "sensor.dryer_total_time": SimpleNamespace(state="60"),
+            "sensor.dryer_remaining_time": SimpleNamespace(state="0"),
+        }.get(eid)
+
+    hass.states.get.side_effect = _get
+
+    tracker = ldy.DryerSessionTracker(
+        hass,
+        status_entity="sensor.dryer_current_status",
+        energy_yesterday_entity="sensor.dryer_energy_yesterday",
+        active_states=["running", "cooling"],
+    )
+    tracker.total_time_entity = "sensor.dryer_total_time"
+    tracker.remaining_time_entity = "sensor.dryer_remaining_time"
+
+    result = tracker._resume_from_lg_sensors(now)
+    assert result is None
+
+
+@pytest.mark.parametrize(
+    "total,remaining",
+    [
+        ("unknown", "15"),
+        ("60", "unknown"),
+        ("not-a-number", "15"),
+        ("60", "75"),   # remaining > total
+        ("0", "0"),     # total <= 0
+        ("-5", "0"),    # negative total
+        ("60", "-5"),   # negative remaining
+        ("2000", "0"),  # elapsed > 24h
+    ],
+)
+def test_14_lg_sensor_resume_rejects_invalid_values(total, remaining, local_tz_utc):
+    now = datetime(2026, 4, 19, 14, 30, tzinfo=timezone.utc)
+    hass = MagicMock()
+
+    def _get(eid: str):
+        return {
+            "sensor.dryer_current_status": SimpleNamespace(state="running"),
+            "sensor.dryer_total_time": SimpleNamespace(state=total),
+            "sensor.dryer_remaining_time": SimpleNamespace(state=remaining),
+        }.get(eid)
+
+    hass.states.get.side_effect = _get
+
+    tracker = ldy.DryerSessionTracker(
+        hass,
+        "sensor.dryer_current_status",
+        "sensor.dryer_energy_yesterday",
+        ["running", "cooling"],
+    )
+    tracker.total_time_entity = "sensor.dryer_total_time"
+    tracker.remaining_time_entity = "sensor.dryer_remaining_time"
+
+    assert tracker._resume_from_lg_sensors(now) is None
+
+
+@pytest.mark.asyncio
+async def test_15_tier_fallthrough_lg_unavailable_history_succeeds(
+    reset_stat_state, local_tz_utc, monkeypatch
+):
+    """LG sensors unavailable -> tier 1 returns None -> history walk (tier 2) succeeds.
+
+    Guards against regression in tier ordering: if the three-tier resolver
+    in async_start is wired incorrectly, the history walk would be skipped
+    and _current_session_start would fall through to utcnow().
+    """
+    T0 = datetime(2026, 4, 19, 14, 0, 0, tzinfo=timezone.utc)
+    T1 = datetime(2026, 4, 19, 14, 12, 0, tzinfo=timezone.utc)
+    T2 = datetime(2026, 4, 19, 14, 25, 0, tzinfo=timezone.utc)
+    now_after_restart = datetime(2026, 4, 19, 14, 30, 0, tzinfo=timezone.utc)
+    _freeze_now(monkeypatch, now_after_restart)
+
+    import homeassistant.components.recorder.history as rec_history
+
+    state_entity = "sensor.dryer_current_status"
+
+    def _mk(state_val: str, ts: datetime):
+        return SimpleNamespace(state=state_val, last_changed=ts, last_updated=ts)
+
+    history_payload = {
+        state_entity: [
+            _mk("initial", T0),
+            _mk("running", T1),
+            _mk("running", T2),
+        ]
+    }
+    calls: list = []
+
+    def _mock_get_last_state_changes(hass, number_of_states, entity_id):
+        calls.append((number_of_states, entity_id))
+        return history_payload
+
+    monkeypatch.setattr(
+        rec_history, "get_last_state_changes", _mock_get_last_state_changes
+    )
+
+    hass = MagicMock()
+
+    def _get(eid: str):
+        return {
+            "sensor.dryer_current_status": SimpleNamespace(state="running"),
+            # LG sensors are unavailable -> tier 1 must return None.
+            "sensor.dryer_total_time": SimpleNamespace(state="unavailable"),
+            "sensor.dryer_remaining_time": SimpleNamespace(state="unknown"),
+        }.get(eid)
+
+    hass.states.get.side_effect = _get
+
+    tracker = ldy.DryerSessionTracker(
+        hass,
+        status_entity=state_entity,
+        energy_yesterday_entity="sensor.dryer_energy_yesterday",
+        active_states=["running", "cooling"],
+    )
+    tracker.total_time_entity = "sensor.dryer_total_time"
+    tracker.remaining_time_entity = "sensor.dryer_remaining_time"
+
+    await tracker.async_start()
+
+    assert calls, (
+        "get_last_state_changes was never called; tier 2 (history walk) "
+        "was not reached when tier 1 (LG sensors) returned None."
+    )
+    assert tracker._current_session_start == T1, (
+        f"Expected fallthrough to history walk producing T1={T1.isoformat()}, "
+        f"got {tracker._current_session_start}"
+    )
+    assert tracker._current_session_start != now_after_restart
