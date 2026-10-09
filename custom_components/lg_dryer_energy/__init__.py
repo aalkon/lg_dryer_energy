@@ -1,571 +1,475 @@
-"""
-LG Dryer Energy Attribution
-
-Tracks dryer run sessions from sensor.dryer_current_status and, when
-sensor.dryer_energy_yesterday updates each morning, proportionally
-distributes yesterday's energy across the recorded sessions. The energy
-is injected into Home Assistant's long-term statistics via
-async_add_external_statistics, backdated to each session's actual hour.
-
-This means the Energy Dashboard shows dryer energy in the correct time
-buckets rather than lumped at the morning update time.
-
-Installation:
-  1. Copy this folder to custom_components/lg_dryer_energy/
-  2. Add to configuration.yaml (see CONFIG below)
-  3. Restart Home Assistant
-  4. In Energy Dashboard → Individual Devices, look for
-     "lg_dryer_energy:dryer_energy_attributed"
-
-Configuration (configuration.yaml):
-  lg_dryer_energy:
-    status_entity: sensor.dryer_current_status
-    energy_yesterday_entity: sensor.dryer_energy_yesterday
-    active_states:
-      - running
-      - cooling
-"""
+"""Estimate dryer energy timing from LG totals and observed run sessions."""
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
-from datetime import datetime, timedelta, timezone
+import math
+from contextlib import suppress
+from copy import deepcopy
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
+import homeassistant.util.dt as dt_util
 from homeassistant.components.recorder import get_instance
-from homeassistant.components.recorder.models import StatisticData
+from homeassistant.components.recorder.models import StatisticData, StatisticMeanType
 from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
     statistics_during_period,
 )
-from homeassistant.const import UnitOfEnergy
-from homeassistant.core import HomeAssistant, Event, callback
-from homeassistant.helpers.event import async_track_state_change_event
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP, UnitOfEnergy
+from homeassistant.core import CoreState, Event, HomeAssistant, callback
+from homeassistant.helpers.event import (
+    async_track_state_change_event,
+    async_track_time_interval,
+)
+from homeassistant.helpers.start import async_at_started
 from homeassistant.helpers.storage import Store
-import homeassistant.util.dt as dt_util
+
+from .ledger import combined_hours, compact, hour_key, timestamp, update_day
+from .source import YesterdaySource, native_energy_entity
 
 _LOGGER = logging.getLogger(__name__)
-
 DOMAIN = "lg_dryer_energy"
 STATISTIC_ID = f"{DOMAIN}:dryer_energy_attributed"
 STORAGE_KEY = f"{DOMAIN}.sessions"
-STORAGE_VERSION = 2
-
-# Session retention window. Any session whose local end-date is strictly older
-# than `last_processed_local_date` is considered fully handled. Sessions whose
-# end-date is newer are preserved, capped by this outer window to prevent
-# unbounded growth if attribution stops running for a long time.
+STORAGE_VERSION = 3
 SESSION_RETENTION_DAYS = 14
-
-# State values that must be treated as "no reading" rather than a numeric
-# transition. A flap into/out of these states is not a new event.
+RECORDER_TIMEOUT_SECONDS = 30
 _NON_NUMERIC_STATES = frozenset({"unknown", "unavailable", "none", ""})
-
-# Default configuration
 DEFAULT_STATUS_ENTITY = "sensor.dryer_current_status"
 DEFAULT_ENERGY_YESTERDAY_ENTITY = "sensor.dryer_energy_yesterday"
+DEFAULT_ENERGY_TODAY_ENTITY = "sensor.dryer_energy_today"
 DEFAULT_ACTIVE_STATES = ["running", "cooling"]
 DEFAULT_TOTAL_TIME_ENTITY = "sensor.dryer_total_time"
 DEFAULT_REMAINING_TIME_ENTITY = "sensor.dryer_remaining_time"
 
 
 async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
-    """Set up the LG Dryer Energy Attribution integration."""
-
+    """Set up one dryer, preserving the existing external statistic ID."""
     conf = config.get(DOMAIN, {})
-    status_entity = conf.get("status_entity", DEFAULT_STATUS_ENTITY)
-    energy_yesterday_entity = conf.get(
-        "energy_yesterday_entity", DEFAULT_ENERGY_YESTERDAY_ENTITY
-    )
-    active_states = conf.get("active_states", DEFAULT_ACTIVE_STATES)
-    total_time_entity = conf.get(
-        "total_time_entity", DEFAULT_TOTAL_TIME_ENTITY
-    )
-    remaining_time_entity = conf.get(
-        "remaining_time_entity", DEFAULT_REMAINING_TIME_ENTITY
-    )
-
     tracker = DryerSessionTracker(
         hass,
-        status_entity,
-        energy_yesterday_entity,
-        active_states,
-        total_time_entity=total_time_entity,
-        remaining_time_entity=remaining_time_entity,
+        conf.get("status_entity", DEFAULT_STATUS_ENTITY),
+        conf.get("energy_yesterday_entity", DEFAULT_ENERGY_YESTERDAY_ENTITY),
+        conf.get("active_states", DEFAULT_ACTIVE_STATES),
+        total_time_entity=conf.get("total_time_entity", DEFAULT_TOTAL_TIME_ENTITY),
+        remaining_time_entity=conf.get("remaining_time_entity", DEFAULT_REMAINING_TIME_ENTITY),
+        energy_today_entity=conf.get("energy_today_entity", DEFAULT_ENERGY_TODAY_ENTITY),
+        migration_last_processed_date=conf.get("migration_last_processed_date"),
     )
     await tracker.async_start()
-
     hass.data[DOMAIN] = tracker
     return True
 
 
 class _LgDryerStore(Store):
-    """Store subclass that migrates v1 -> v2 by adding last_processed_local_date."""
+    async def async_save_verified(self, data):
+        """Read the actual file: Store logs some write errors without raising.
 
-    async def _async_migrate_func(
-        self,
-        old_major_version: int,
-        old_minor_version: int,
-        old_data: dict[str, Any],
-    ) -> dict[str, Any]:
-        if old_major_version < 2:
-            old_data.setdefault("last_processed_local_date", None)
+        Store.async_load can return pending/cached data, so it cannot establish
+        that an accounting intent survived a disk write failure.
+        """
+        snapshot = deepcopy(data)
+        await self.async_save(snapshot)
+        if self.hass.state is CoreState.stopping:
+            return  # HA will persist the intent at its final-write event.
+        saved = await self.hass.async_add_executor_job(self._read_saved_data)
+        if self.hass.state is CoreState.stopping:
+            return
+        if (
+            saved.get("version") != self.version
+            or saved.get("key") != self.key
+            or saved.get("data") != snapshot
+        ):
+            raise OSError("Dryer accounting storage did not persist the expected data")
+
+    def _read_saved_data(self):
+        return json.loads(Path(self.path).read_text(encoding="utf-8"))
+
+    async def _async_migrate_func(self, old_major_version, old_minor_version, old_data):
+        """Keep v1/v2 sessions and the last fully processed reporting date."""
+        old_data.setdefault("last_processed_local_date", None)
+        old_data.setdefault("ledger", None)
         return old_data
 
 
-class DryerSessionTracker:
-    """
-    Tracks dryer run sessions and attributes energy to them.
+def _energy_wh(state) -> float | None:
+    """Reject missing/invalid readings; a genuine zero is not unavailable."""
+    if state is None or getattr(state, "attributes", {}).get("restored"):
+        return None
+    try:
+        value = float(state.state)
+    except (ValueError, TypeError):
+        return None
+    unit = getattr(state, "attributes", {}).get("unit_of_measurement", "Wh")
+    if unit not in ("Wh", "kWh") or not math.isfinite(value) or value < 0:
+        return None
+    return value * (1000 if unit == "kWh" else 1)
 
-    A "session" is a contiguous period where dryer_current_status is in
-    one of the active_states (running, cooling). We record the start and
-    end timestamps. When energy_yesterday updates (the LG cloud morning push),
-    we look at yesterday's sessions, proportionally split the reported
-    Wh across them by duration, and inject statistics rows backdated to
-    each session's hour(s).
-    """
+
+class DryerSessionTracker:
+    """Serialize session changes and durable, replaceable daily allocations."""
 
     def __init__(
         self,
-        hass: HomeAssistant,
-        status_entity: str,
-        energy_yesterday_entity: str,
-        active_states: list[str],
-        total_time_entity: str = DEFAULT_TOTAL_TIME_ENTITY,
-        remaining_time_entity: str = DEFAULT_REMAINING_TIME_ENTITY,
-    ) -> None:
+        hass,
+        status_entity,
+        energy_yesterday_entity,
+        active_states,
+        total_time_entity=DEFAULT_TOTAL_TIME_ENTITY,
+        remaining_time_entity=DEFAULT_REMAINING_TIME_ENTITY,
+        energy_today_entity=DEFAULT_ENERGY_TODAY_ENTITY,
+        migration_last_processed_date=None,
+    ):
         self.hass = hass
         self.status_entity = status_entity
         self.energy_yesterday_entity = energy_yesterday_entity
+        self.energy_today_entity = energy_today_entity
         self.active_states = [s.lower() for s in active_states]
         self.total_time_entity = total_time_entity
         self.remaining_time_entity = remaining_time_entity
-
-        # Persistent storage for sessions surviving restarts
-        self._store = _LgDryerStore(hass, STORAGE_VERSION, STORAGE_KEY)
-        self._sessions: list[dict] = []  # {start: isoformat, end: isoformat|None}
+        self._migration_date = (
+            date.fromisoformat(str(migration_last_processed_date)).isoformat()
+            if migration_last_processed_date is not None
+            else None
+        )
+        self._migration_retry_at = None
+        self._migration_warned = False
+        self._store = _LgDryerStore(hass, STORAGE_VERSION, STORAGE_KEY, atomic_writes=True)
+        self._yesterday_source = YesterdaySource(hass, energy_yesterday_entity)
+        self._sessions: list[dict] = []
         self._current_session_start: datetime | None = None
-
-        # Running sum kept only for diagnostic/backwards-compat purposes.
-        # The authoritative baseline is always re-derived from the
-        # statistics database at attribution time.
-        self._cumulative_kwh: float = 0.0
-
-        # ISO-date (YYYY-MM-DD, local) of the last successfully attributed
-        # day. Used as the primary idempotency guard to prevent a duplicate
-        # attribution when energy_yesterday flaps through unknown/unavailable.
         self._last_processed_local_date: str | None = None
+        self._ledger: dict | None = None
+        self._lock = asyncio.Lock()
+        self._refresh_lock = asyncio.Lock()
+        self._unsubscribers = []
+        self._refresh_task = None
+        self._stopped = False
 
-    async def async_start(self) -> None:
-        """Load persisted state and start listening."""
-        stored = await self._store.async_load()
-        if stored:
-            self._sessions = stored.get("sessions", []) or []
-            self._cumulative_kwh = stored.get("cumulative_kwh", 0.0) or 0.0
-            start_raw = stored.get("current_session_start")
-            if start_raw:
-                self._current_session_start = datetime.fromisoformat(start_raw)
-            # v2 key: may be missing for storage files that predate the
-            # migration or were manually edited.
-            self._last_processed_local_date = stored.get(
-                "last_processed_local_date"
-            )
-            _LOGGER.info(
-                "Loaded %d stored sessions, cumulative=%.3f kWh, last_processed=%s",
-                len(self._sessions),
-                self._cumulative_kwh,
-                self._last_processed_local_date,
-            )
+    async def async_start(self):
+        stored = await self._store.async_load() or {}
+        self._sessions = stored.get("sessions", [])
+        self._last_processed_local_date = stored.get("last_processed_local_date")
+        self._ledger = stored.get("ledger")
+        if self._ledger is None and not self._last_processed_local_date:
+            self._last_processed_local_date = self._migration_date
+        if start := stored.get("current_session_start"):
+            self._current_session_start = timestamp(start)
 
-        # If we missed the dryer starting while HA was down, check
-        # the current state now
-        state = self.hass.states.get(self.status_entity)
-        if state and state.state.lower() in self.active_states:
-            if self._current_session_start is None:
-                # --- Three-tier session-start reconstruction ---
-                # The dominant cause of truncated session attribution is
-                # "HA restarted mid-cycle" (or HA was down when the cycle
-                # began). Defaulting to utcnow() here erases the pre-restart
-                # portion of the active run. Resolution order:
-                #   1. LG total_time/remaining_time sensors (robust to HA
-                #      downtime and recorder purges).
-                #   2. Recorder state history walk.
-                #   3. utcnow() as last-resort fallback.
-                now = dt_util.utcnow()
-
-                reconstructed = self._resume_from_lg_sensors(now)
-                source = "lg_sensors"
-
-                if reconstructed is None:
-                    reconstructed = await self._async_reconstruct_session_start()
-                    source = "history_walk"
-
-                if reconstructed is None:
-                    reconstructed = now
-                    source = "utcnow_fallback"
-
-                self._current_session_start = reconstructed
-                _LOGGER.info(
-                    "Dryer already active on startup; session start=%s (source=%s)",
-                    reconstructed.isoformat(),
-                    source,
+        async with self._lock:
+            # Subscribe before any snapshot-related await; queued events retain
+            # their original timestamps and run after initialization finishes.
+            self._unsubscribers.append(
+                async_track_state_change_event(
+                    self.hass, [self.status_entity], self._async_on_status_change
                 )
-
-        # Listen for status changes (session start/end)
-        async_track_state_change_event(
-            self.hass, [self.status_entity], self._async_on_status_change
-        )
-
-        # Listen for energy_yesterday changes (morning update)
-        async_track_state_change_event(
-            self.hass,
-            [self.energy_yesterday_entity],
-            self._async_on_energy_yesterday_change,
-        )
-
-    @callback
-    def _async_on_status_change(self, event: Event) -> None:
-        """Handle dryer status transitions."""
-        new_state = event.data.get("new_state")
-        if new_state is None:
-            return
-
-        now = dt_util.utcnow()
-        is_active = new_state.state.lower() in self.active_states
-
-        if is_active and self._current_session_start is None:
-            # Session starting
-            self._current_session_start = now
-            _LOGGER.debug("Dryer session started at %s", now.isoformat())
-
-        elif not is_active and self._current_session_start is not None:
-            # Session ending
-            session = {
-                "start": self._current_session_start.isoformat(),
-                "end": now.isoformat(),
-            }
-            self._sessions.append(session)
-            duration = (now - self._current_session_start).total_seconds()
-            _LOGGER.info(
-                "Dryer session ended: %s → %s (%.0f min)",
-                self._current_session_start.isoformat(),
-                now.isoformat(),
-                duration / 60,
             )
-            self._current_session_start = None
-            self.hass.async_create_task(self._async_save())
-
-    @callback
-    def _async_on_energy_yesterday_change(self, event: Event) -> None:
-        """Handle energy_yesterday sensor update (morning push from LG cloud).
-
-        LG ThinQ sensors routinely flap through `unknown` and `unavailable`.
-        A transition FROM one of those states BACK to the prior numeric value
-        is not a new event and must not trigger re-attribution. This was the
-        root cause of the duplicate-attribution bug: catching the ValueError
-        from float("unknown") and falling through into the write path.
-        """
-        new_state = event.data.get("new_state")
-        old_state = event.data.get("old_state")
-
-        if new_state is None:
-            return
-
-        new_raw = (new_state.state or "").lower()
-        if new_raw in _NON_NUMERIC_STATES:
-            _LOGGER.debug(
-                "energy_yesterday new_state is non-numeric (%s), ignoring",
-                new_raw,
-            )
-            return
-
-        # A transition OUT OF unknown/unavailable back to a previously-seen
-        # numeric value is not a new LG push. Reject it before touching the
-        # write path. The daily idempotency guard in _async_attribute_energy
-        # provides a second layer of defense.
-        if old_state is not None:
-            old_raw = (old_state.state or "").lower()
-            if old_raw in _NON_NUMERIC_STATES:
-                _LOGGER.debug(
-                    "energy_yesterday transitioned from %s back to numeric; "
-                    "treating as flap recovery, not a new event",
-                    old_raw,
-                )
-                return
-
-        try:
-            new_wh = float(new_state.state)
-        except (ValueError, TypeError):
-            _LOGGER.debug(
-                "energy_yesterday new_state %r is not parseable as float",
-                new_state.state,
-            )
-            return
-
-        if new_wh <= 0:
-            _LOGGER.debug("energy_yesterday is 0 or negative, skipping")
-            return
-
-        # Secondary numeric-equality guard. This is no longer the primary
-        # defense, but catches the case where both states are numeric and
-        # identical (e.g., a redundant state-write by the ThinQ integration).
-        if old_state is not None:
             try:
-                if float(old_state.state) == new_wh:
-                    return
-            except (ValueError, TypeError):
-                # old_state was numeric-like but malformed. Continue to
-                # the daily idempotency check inside _async_attribute_energy
-                # rather than blindly reprocessing.
-                pass
-
-        _LOGGER.info(
-            "energy_yesterday updated to %.0f Wh, processing attribution", new_wh
+                state = self.hass.states.get(self.status_entity)
+                if state and state.state.lower() in self.active_states:
+                    if self._current_session_start is None:
+                        now = dt_util.utcnow()
+                        self._current_session_start = (
+                            self._resume_from_lg_sensors(now)
+                            or await self._async_reconstruct_session_start()
+                            or now
+                        )
+                elif state and state.state.lower() not in _NON_NUMERIC_STATES:
+                    self._close_session(getattr(state, "last_changed", dt_util.utcnow()))
+                self._prune_sessions()
+                await self._async_save()
+            except BaseException:
+                self._unsubscribers.pop()()
+                raise
+        energy_entities = [self.energy_yesterday_entity]
+        if self.energy_today_entity:
+            energy_entities.append(self.energy_today_entity)
+        self._unsubscribers.append(
+            async_track_state_change_event(self.hass, energy_entities, self._queue_refresh)
         )
-
-        # Schedule the async attribution work
-        self.hass.async_create_task(
-            self._async_attribute_energy(new_wh)
+        # The minute timer checks cached today data and drives the separately
+        # throttled, date-verified yesterday read (including equal daily totals).
+        self._unsubscribers.append(
+            async_track_time_interval(self.hass, self._queue_refresh, timedelta(minutes=1))
         )
+        self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, self.async_stop)
+        # Recorder does not process its write queue until HA has started.
+        # Never await a statistics import from integration setup.
+        self._unsubscribers.append(async_at_started(self.hass, self._queue_refresh))
 
-    async def _async_attribute_energy(self, total_wh: float) -> None:
-        """
-        Distribute yesterday's total Wh across yesterday's dryer sessions,
-        proportional to each session's duration, and inject into statistics.
+    async def async_stop(self, event=None):
+        self._stopped = True
+        for unsubscribe in self._unsubscribers:
+            unsubscribe()
+        self._unsubscribers.clear()
+        if self._refresh_task:
+            self._refresh_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._refresh_task
+        async with self._lock:
+            # HA defers Store writes during shutdown until its final-write event.
+            await self._async_save(verify=False)
 
-        Idempotent by local date: a repeated call for the same day is a no-op.
-        Baseline is re-derived each call from the statistics database as of
-        the moment yesterday began, so two calls for the same day produce
-        byte-identical StatisticData lists.
-        """
-        now = dt_util.utcnow()
-        # "Yesterday" in local time
-        local_now = dt_util.as_local(now)
-        yesterday_start = (
-            local_now.replace(hour=0, minute=0, second=0, microsecond=0)
-            - timedelta(days=1)
-        )
-        yesterday_end = yesterday_start + timedelta(days=1)
-        yesterday_date_iso = yesterday_start.date().isoformat()
+    @callback
+    def _queue_refresh(self, event=None):
+        if (
+            not self._stopped
+            and self.hass.state is CoreState.running
+            and (self._refresh_task is None or self._refresh_task.done())
+        ):
+            self._refresh_task = self.hass.async_create_task(self._async_refresh())
 
-        # --- Fix #1: idempotency by local date -------------------------------
-        if self._last_processed_local_date == yesterday_date_iso:
-            _LOGGER.debug(
-                "Already processed %s, skipping duplicate attribution for %.0f Wh",
-                yesterday_date_iso,
-                total_wh,
-            )
+    def _close_session(self, end):
+        if self._current_session_start is None:
             return
-
-        # Convert to UTC for comparison
-        yesterday_start_utc = dt_util.as_utc(yesterday_start)
-        yesterday_end_utc = dt_util.as_utc(yesterday_end)
-
-        # --- Fix #8: attribute by session end-date (LG's model) --------------
-        # Empirically verified (April 2026): LG reports each cycle's energy
-        # under the local date the cycle ENDED on, not the date it started.
-        # A cycle running 23:27 local D-1 -> 00:19 local D shows up as 0 on
-        # D-1 and as the full cycle energy on D.
-        #
-        # Therefore: a session belongs to yesterday's attribution if and only
-        # if its end timestamp, converted to local time, falls on
-        # yesterday_date_iso. We use the session's FULL unclipped duration for
-        # proportional splitting, and when laying down hourly rows we allow
-        # them to fall on date D-1 (the day before yesterday) for the
-        # pre-midnight portion of an overnight cycle. Those rows are real
-        # energy use and are correct even though LG's D-1 daily total is 0.
-        #
-        # A session whose end-local-date is AFTER yesterday (typically today,
-        # for a cycle that crossed midnight into today) is preserved for its
-        # own future attribution pass. A session whose end-local-date is
-        # strictly BEFORE yesterday has missed its window and is logged and
-        # dropped.
-        yesterday_local_date = yesterday_start.date()
-        retention_cutoff_utc = yesterday_start_utc - timedelta(
-            days=SESSION_RETENTION_DAYS
-        )
-        yesterday_sessions: list[dict] = []
-        remaining_sessions: list[dict] = []
-
-        for session in self._sessions:
-            s_start = datetime.fromisoformat(session["start"])
-            s_end_raw = session.get("end")
-            if not s_end_raw:
-                _LOGGER.warning(
-                    "Persisted session missing end timestamp, skipping: %r",
-                    session,
-                )
-                continue
-            s_end = datetime.fromisoformat(s_end_raw)
-            if s_start.tzinfo is None:
-                s_start = s_start.replace(tzinfo=timezone.utc)
-            if s_end.tzinfo is None:
-                s_end = s_end.replace(tzinfo=timezone.utc)
-
-            end_local_date = dt_util.as_local(s_end).date()
-
-            if end_local_date == yesterday_local_date:
-                # Belongs to this attribution pass. Use full duration.
-                yesterday_sessions.append(
-                    {
-                        "start": s_start,
-                        "end": s_end,
-                        "duration": (s_end - s_start).total_seconds(),
-                    }
-                )
-            elif end_local_date > yesterday_local_date:
-                # Ended on today (or later, if clock skew). Preserve for a
-                # future attribution pass once LG reports it.
-                remaining_sessions.append(session)
-            else:
-                # end_local_date < yesterday: session's attribution day has
-                # already passed. Drop with appropriate logging.
-                if s_end < retention_cutoff_utc:
-                    _LOGGER.warning(
-                        "Dropping session ending %s, older than %d-day "
-                        "retention window and never attributed",
-                        s_end.isoformat(),
-                        SESSION_RETENTION_DAYS,
-                    )
-                else:
-                    _LOGGER.warning(
-                        "Session %s -> %s ended on local date %s which is "
-                        "older than yesterday (%s); never attributed (HA "
-                        "likely down on its attribution day)",
-                        session["start"],
-                        s_end_raw,
-                        end_local_date.isoformat(),
-                        yesterday_date_iso,
-                    )
-
-        # A session that is still in progress (self._current_session_start set,
-        # no end recorded) cannot be attributed yet: LG only reports energy
-        # after a cycle completes. Do NOT synthesize a partial session into
-        # yesterday's attribution; it will be picked up once the cycle ends
-        # and energy_yesterday fires for its local end-date.
-
-        if not yesterday_sessions:
-            _LOGGER.warning(
-                "Got %.0f Wh for yesterday but found no dryer sessions. "
-                "Attributing entire amount to noon yesterday as fallback.",
-                total_wh,
-            )
-            # Fallback: put it all at noon yesterday
-            noon = yesterday_start_utc + timedelta(hours=12)
-            yesterday_sessions = [
-                {"start": noon, "end": noon + timedelta(minutes=1), "duration": 60}
-            ]
-
-        total_duration = sum(s["duration"] for s in yesterday_sessions)
-        if total_duration <= 0:
-            _LOGGER.error("Total session duration is 0, cannot attribute energy")
-            return
-
-        total_kwh = total_wh / 1000.0
-
-        _LOGGER.info(
-            "Attributing %.3f kWh across %d sessions (%.0f min total)",
-            total_kwh,
-            len(yesterday_sessions),
-            total_duration / 60,
-        )
-
-        # Build hourly energy buckets
-        hourly_kwh: dict[datetime, float] = {}
-
-        for session in yesterday_sessions:
-            session_kwh = total_kwh * (session["duration"] / total_duration)
-            session_start: datetime = session["start"]
-            session_end: datetime = session["end"]
-
-            # Split this session's energy across the hours it spans
-            # Ensure UTC timezone is set for arithmetic
-            if session_start.tzinfo is None:
-                session_start = session_start.replace(tzinfo=timezone.utc)
-            if session_end.tzinfo is None:
-                session_end = session_end.replace(tzinfo=timezone.utc)
-
-            hour_cursor = session_start.replace(
-                minute=0, second=0, microsecond=0
-            )
-            while hour_cursor < session_end:
-                hour_end = hour_cursor + timedelta(hours=1)
-                # Overlap between this hour and the session
-                overlap_start = max(hour_cursor, session_start)
-                overlap_end = min(hour_end, session_end)
-                overlap_seconds = (overlap_end - overlap_start).total_seconds()
-
-                if overlap_seconds > 0 and session["duration"] > 0:
-                    # Fraction of this session that falls in this hour
-                    fraction = overlap_seconds / session["duration"]
-                    hourly_kwh[hour_cursor] = hourly_kwh.get(hour_cursor, 0.0) + (
-                        session_kwh * fraction
-                    )
-
-                hour_cursor = hour_end
-
-        # --- Fix #3/#8: stable baseline from BEFORE the earliest written hour
-        # Under the end-date model, an overnight cycle may write an hour that
-        # falls on date D-1 (the day before yesterday). The baseline must be
-        # fetched strictly before the earliest hour we're about to write, not
-        # merely before yesterday_start, so the cumulative sum remains
-        # monotonic and replay-idempotent.
-        if hourly_kwh:
-            earliest_hour_utc = min(hourly_kwh.keys())
+        start = self._current_session_start
+        if timedelta(0) < end - start <= timedelta(days=1):
+            self._sessions.append({"start": start.isoformat(), "end": end.isoformat()})
         else:
-            earliest_hour_utc = yesterday_start_utc
-        baseline_sum = await self._async_get_baseline_sum(earliest_hour_utc)
+            _LOGGER.warning("Ignoring implausible dryer session: %s to %s", start, end)
+        self._current_session_start = None
+        self._prune_sessions()
 
-        # Build StatisticData rows sorted by hour
-        statistics: list[StatisticData] = []
-        running_sum = baseline_sum
+    def _prune_sessions(self):
+        """Bound history even when no energy can be attributed; warn only once."""
+        cutoff = dt_util.utcnow() - timedelta(days=SESSION_RETENTION_DAYS)
+        retained = []
+        for session in self._sessions:
+            try:
+                start, end = timestamp(session["start"]), timestamp(session["end"])
+                if not timedelta(0) < end - start <= timedelta(days=1):
+                    raise ValueError("Invalid session duration")
+            except (KeyError, TypeError, ValueError):
+                _LOGGER.warning("Ignoring implausible dryer session: %s", session)
+                continue
+            if end >= cutoff:
+                retained.append(session)
+        changed = retained != self._sessions
+        self._sessions = retained
+        return changed
 
-        for hour_ts in sorted(hourly_kwh.keys()):
-            kwh_this_hour = hourly_kwh[hour_ts]
-            running_sum += kwh_this_hour
-            statistics.append(
-                StatisticData(
-                    start=hour_ts,
-                    # Fix #7: per-hour delta is the correct `state` for a
-                    # has_sum=True series. `sum` is the cumulative.
-                    state=kwh_this_hour,
-                    sum=running_sum,
-                )
-            )
-            _LOGGER.debug(
-                "  %s: +%.4f kWh (cumulative: %.4f)",
-                hour_ts.isoformat(),
-                kwh_this_hour,
-                running_sum,
-            )
+    async def _async_on_status_change(self, event: Event):
+        state = event.data.get("new_state")
+        if state is None or state.state.lower() in _NON_NUMERIC_STATES:
+            return  # A connectivity flap is not a cycle completion.
+        changed = getattr(state, "last_changed", None) or getattr(event, "time_fired", None)
+        if not isinstance(changed, datetime):
+            changed = dt_util.utcnow()
+        async with self._lock:
+            previous_start = self._current_session_start
+            if state.state.lower() in self.active_states:
+                if self._current_session_start is None:
+                    self._current_session_start = changed
+            else:
+                self._close_session(changed)
+            if self._current_session_start == previous_start:
+                return
+            await self._async_save()
+        self._queue_refresh()
 
-        # Inject into HA statistics
-        metadata = {
-            "has_mean": False,
-            "has_sum": True,
-            "name": "Dryer Energy (Attributed)",
-            "source": DOMAIN,
-            "statistic_id": STATISTIC_ID,
-            "unit_of_measurement": UnitOfEnergy.KILO_WATT_HOUR,
-        }
+    async def _async_refresh(self):
+        # Keep source reads serialized, without blocking status persistence.
+        async with self._refresh_lock:
+            await self._async_refresh_once()
 
-        # --- Fix #4: mutate state only on successful write -------------------
-        # async_add_external_statistics is a synchronous callback; if it
-        # raises, none of the state below is touched and the next invocation
-        # can retry cleanly.
-        async_add_external_statistics(self.hass, metadata, statistics)
-
-        _LOGGER.info(
-            "Injected %d hourly statistics rows (%.3f kWh total for %s)",
-            len(statistics),
-            total_kwh,
-            yesterday_date_iso,
+    async def _async_refresh_once(self):
+        if self._stopped or self.hass.state is not CoreState.running:
+            return
+        now = dt_util.utcnow()
+        yesterday = (dt_util.as_local(now) - timedelta(days=1)).date()
+        value = await self._yesterday_source.async_read(
+            yesterday, now, _energy_wh(self.hass.states.get(self.energy_yesterday_entity))
         )
+        async with self._lock:
+            if self._stopped or self.hass.state is not CoreState.running:
+                return
+            try:
+                if self._prune_sessions():
+                    await self._async_save()
+                if self._ledger and self._ledger.get("dirty"):
+                    await self._async_flush()
+                local_now = dt_util.as_local(dt_util.utcnow())
+                if value is not None:
+                    await self._async_record(yesterday.isoformat(), value, final=True)
 
-        self._sessions = remaining_sessions
-        self._cumulative_kwh = running_sum
-        self._last_processed_local_date = yesterday_date_iso
+                state = (
+                    self.hass.states.get(self.energy_today_entity)
+                    if self.energy_today_entity
+                    and native_energy_entity(self.hass, self.energy_today_entity, "today")
+                    else None
+                )
+                value = _energy_wh(state)
+                if value is not None:
+                    reset = getattr(state, "attributes", {}).get("last_reset")
+                    try:
+                        reset = timestamp(reset) if isinstance(reset, str) else reset
+                        day = (
+                            dt_util.as_local(reset).date() if isinstance(reset, datetime) else None
+                        )
+                    except (ValueError, TypeError):
+                        day = None
+                    # Never guess which day a stale pre-midnight total covers.
+                    if day == local_now.date() and self._current_session_start is None:
+                        await self._async_record(day.isoformat(), value, final=False)
+            except Exception:
+                _LOGGER.exception("Energy attribution failed; persisted work will be retried")
+
+    def _sessions_for_day(self, day):
+        result = []
+        for session in self._sessions:
+            if not session.get("end"):
+                continue
+            start, end = timestamp(session["start"]), timestamp(session["end"])
+            if end <= start or end - start > timedelta(days=1):
+                continue
+            if dt_util.as_local(end).date().isoformat() == day:
+                result.append({"start": start.isoformat(), "end": end.isoformat()})
+        return result
+
+    async def _async_record(self, day: str, total_wh: float, *, final: bool):
+        """Replace one reporting day's contribution and rebuild later sums."""
+        if not math.isfinite(total_wh) or total_wh < 0:
+            return
+        if self._last_processed_local_date and day <= self._last_processed_local_date:
+            return  # Already included in migrated v2 statistics.
+        sessions = self._sessions_for_day(day)
+        if self._ledger is None:
+            if total_wh == 0:
+                return
+            if not await self._async_initialize_ledger():
+                return
+        local_now = dt_util.as_local(dt_util.utcnow())
+        noon = datetime.fromisoformat(day).replace(hour=12, tzinfo=local_now.tzinfo)
+        previous = self._ledger["days"].get(day)
+        updated = update_day(previous, total_wh, sessions, final=final, fallback=noon)
+        if previous == updated:
+            return
+        candidate = deepcopy(self._ledger)
+        candidate["days"][day] = updated
+        candidate["written_hours"] = sorted(combined_hours(candidate))
+        cutoff = dt_util.utcnow() - timedelta(days=SESSION_RETENTION_DAYS + 2)
+        compact(candidate, cutoff)
+        candidate["dirty"] = True
+        # Durable intent precedes enqueue. Replays replace identical rows and
+        # all later cumulative sums, even after a crash between storage/DB.
+        old = self._ledger
+        self._ledger = candidate
+        try:
+            await self._async_save()
+        except Exception:
+            self._ledger = old
+            raise
+        if self.hass.state is CoreState.running and not self._stopped:
+            await self._async_flush()
+
+    async def _async_read_statistics(self, start, end=None):
+        return (
+            await get_instance(self.hass).async_add_executor_job(
+                statistics_during_period,
+                self.hass,
+                start,
+                end,
+                {STATISTIC_ID},
+                "hour",
+                {"energy": "kWh"},
+                {"sum"},
+            )
+        ).get(STATISTIC_ID, [])
+
+    async def _async_initialize_ledger(self):
+        # One-time migration includes arbitrarily long gaps. A failed query
+        # must never reset an existing cumulative series to zero.
+        now = dt_util.utcnow()
+        if self._migration_retry_at and now < self._migration_retry_at:
+            return False
+        self._migration_retry_at = now + timedelta(hours=1)
+        async with asyncio.timeout(RECORDER_TIMEOUT_SECONDS):
+            rows = await self._async_read_statistics(datetime(1970, 1, 1, tzinfo=UTC))
+        if rows and not self._last_processed_local_date:
+            if not self._migration_warned:
+                _LOGGER.error(
+                    "Existing dryer statistics have no migration marker; restore matching storage "
+                    "or configure migration_last_processed_date (see README recovery instructions). "
+                    "Attribution is paused; retrying hourly."
+                )
+                self._migration_warned = True
+            return False
+        anchor = hour_key(dt_util.utcnow() - timedelta(days=SESSION_RETENTION_DAYS + 2))
+        base_sum = previous = 0.0
+        legacy = {}
+        for row in sorted(rows, key=lambda row: row["start"]):
+            if row.get("sum") is None:
+                continue
+            key = hour_key(datetime.fromtimestamp(row["start"], UTC))
+            value = float(row["sum"])
+            if key < anchor:
+                base_sum = value
+            else:
+                legacy[key] = value - previous
+            previous = value
+        self._ledger = {
+            "anchor": anchor,
+            "base_sum": base_sum,
+            "legacy_hours": legacy,
+            "days": {},
+            "written_hours": list(legacy),
+            "dirty": False,
+        }
+        self._migration_retry_at = None
+        return True
+
+    async def _async_flush(self):
+        ledger = self._ledger
+        hours = combined_hours(ledger)
+        running = ledger["base_sum"]
+        anchor = timestamp(ledger["anchor"])
+        statistics = [StatisticData(start=anchor - timedelta(hours=1), state=0.0, sum=running)]
+        for key in sorted(hours):
+            running += hours[key]
+            statistics.append(StatisticData(start=timestamp(key), state=hours[key], sum=running))
+        async_add_external_statistics(
+            self.hass,
+            {
+                "mean_type": StatisticMeanType.NONE,
+                "has_sum": True,
+                "name": "Dryer Energy (Attributed)",
+                "source": DOMAIN,
+                "statistic_id": STATISTIC_ID,
+                "unit_class": "energy",
+                "unit_of_measurement": UnitOfEnergy.KILO_WATT_HOUR,
+            },
+            statistics,
+        )
+        async with asyncio.timeout(RECORDER_TIMEOUT_SECONDS):
+            await get_instance(self.hass).async_block_till_done()
+            actual = {
+                row["start"]: row.get("sum")
+                for row in await self._async_read_statistics(anchor - timedelta(hours=1))
+            }
+        for row in statistics:
+            value = actual.get(row["start"].timestamp())
+            if value is None or not math.isclose(value, row["sum"], abs_tol=1e-8):
+                raise RuntimeError("Recorder has not committed the expected dryer statistics")
+        ledger["dirty"] = False
+        self._prune_sessions()
         await self._async_save()
+
+    async def _async_save(self, *, verify=True):
+        save = self._store.async_save_verified if verify else self._store.async_save
+        await save(
+            {
+                "sessions": self._sessions,
+                "current_session_start": self._current_session_start.isoformat()
+                if self._current_session_start
+                else None,
+                "last_processed_local_date": self._last_processed_local_date,
+                "ledger": self._ledger,
+            }
+        )
 
     def _resume_from_lg_sensors(self, now: datetime) -> datetime | None:
         """Reconstruct session start from LG's total_time and remaining_time sensors.
@@ -593,7 +497,13 @@ class DryerSessionTracker:
             return None
 
         # Sanity: remaining cannot exceed total, and total must be positive.
-        if total_min <= 0 or remaining_min < 0 or remaining_min > total_min:
+        if (
+            not math.isfinite(total_min)
+            or not math.isfinite(remaining_min)
+            or total_min <= 0
+            or remaining_min < 0
+            or remaining_min > total_min
+        ):
             return None
 
         # During cooling, LG typically reports remaining_time == 0 while the
@@ -601,11 +511,7 @@ class DryerSessionTracker:
         # cycle length excluding cooling, so (total - 0) is NOT the real
         # elapsed. Skip this tier in cooling and let the history walk handle it.
         status_state = self.hass.states.get(self.status_entity)
-        if (
-            status_state
-            and (status_state.state or "").lower() == "cooling"
-            and remaining_min == 0
-        ):
+        if status_state and (status_state.state or "").lower() == "cooling" and remaining_min == 0:
             return None
 
         elapsed_min = total_min - remaining_min
@@ -632,14 +538,11 @@ class DryerSessionTracker:
             )
         except ImportError:
             _LOGGER.debug(
-                "Recorder history module unavailable; cannot reconstruct "
-                "session start from history"
+                "Recorder history module unavailable; cannot reconstruct session start from history"
             )
             return None
 
-        get_last_state_changes = getattr(
-            recorder_history, "get_last_state_changes", None
-        )
+        get_last_state_changes = getattr(recorder_history, "get_last_state_changes", None)
         if get_last_state_changes is None:
             _LOGGER.debug(
                 "get_last_state_changes not present on recorder.history; "
@@ -654,10 +557,8 @@ class DryerSessionTracker:
                 20,
                 self.status_entity,
             )
-        except Exception:  # noqa: BLE001 - defensive across HA versions
-            _LOGGER.exception(
-                "get_last_state_changes failed; cannot reconstruct session start"
-            )
+        except Exception:
+            _LOGGER.exception("get_last_state_changes failed; cannot reconstruct session start")
             return None
 
         states = (changes or {}).get(self.status_entity) or []
@@ -665,9 +566,7 @@ class DryerSessionTracker:
             return None
 
         def _ts(s: Any) -> datetime | None:
-            return getattr(s, "last_changed", None) or getattr(
-                s, "last_updated", None
-            )
+            return getattr(s, "last_changed", None) or getattr(s, "last_updated", None)
 
         # Order ascending by timestamp so the last element is the most recent.
         try:
@@ -699,65 +598,3 @@ class DryerSessionTracker:
                 break
 
         return earliest_active_ts
-
-    async def _async_get_baseline_sum(
-        self, before_utc: datetime
-    ) -> float:
-        """Return the cumulative `sum` of our statistic as of `before_utc`.
-
-        Fetches the newest statistic row strictly before `before_utc`. Used
-        to derive a stable baseline so the attribution is idempotent: running
-        twice with the same inputs yields identical StatisticData lists, and
-        cumulative sums remain monotonic across backdated writes.
-        """
-        window_start = before_utc - timedelta(days=8)
-        try:
-            rows = await get_instance(self.hass).async_add_executor_job(
-                statistics_during_period,
-                self.hass,
-                window_start,
-                before_utc,
-                {STATISTIC_ID},
-                "hour",
-                None,
-                {"sum"},
-            )
-        except Exception:  # noqa: BLE001 - defensive, API shape varies by HA version
-            _LOGGER.exception(
-                "statistics_during_period failed; defaulting baseline to 0.0"
-            )
-            rows = {}
-
-        series = rows.get(STATISTIC_ID) if rows else None
-        if series:
-            last_row = series[-1]
-            baseline = last_row.get("sum")
-            if baseline is not None:
-                _LOGGER.debug(
-                    "Baseline sum=%.4f from stat row at %s (before %s)",
-                    baseline,
-                    last_row.get("start"),
-                    before_utc.isoformat(),
-                )
-                return float(baseline)
-
-        _LOGGER.debug(
-            "No prior stat row before %s; baseline defaults to 0.0",
-            before_utc.isoformat(),
-        )
-        return 0.0
-
-    async def _async_save(self) -> None:
-        """Persist session data and cumulative total."""
-        await self._store.async_save(
-            {
-                "sessions": self._sessions,
-                "cumulative_kwh": self._cumulative_kwh,
-                "current_session_start": (
-                    self._current_session_start.isoformat()
-                    if self._current_session_start
-                    else None
-                ),
-                "last_processed_local_date": self._last_processed_local_date,
-            }
-        )

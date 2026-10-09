@@ -1,54 +1,31 @@
-# lg_dryer_energy tests
+# Tests
 
-Unit tests for the attribution logic. These intentionally do **not** require
-a live Home Assistant instance — `conftest.py` installs lightweight stubs in
-`sys.modules` for the handful of HA symbols the integration imports, so
-`pytest` can run the module's logic directly.
+Install `pytest`, `pytest-asyncio`, and (on Windows) `tzdata`, then run from this repository root:
 
-## Requirements
-
-```bash
-pip install pytest pytest-asyncio
+```sh
+python -m pytest tests -q
 ```
 
-## Run
+`conftest.py` supplies lightweight Home Assistant stubs, file-backed persistence
+which logs write failures without raising (matching HA's Store contract), startup
+callbacks, and an in-memory recorder with historical row upserts and range queries.
 
-From the repository root:
+Coverage includes a 543 Wh example cycle; incremental allocation; next-day
+upward/downward/zero reconciliation; identical consecutive totals; missing
+sources; stale dates; UTC/local midnight; DST; overlapping overnight hours;
+restart and failed-write replay; concurrent callbacks; v2 migration and long
+idle gaps; bounded ledger compaction; and session reconstruction. Review regressions
+cover dirty replay before HA starts, silent storage failure during migration,
+status callbacks delayed across midnight, and republished stale yesterday values.
+Detailed API tests require the requested date, distinguish missing data from zero,
+and check the native entity/SDK call path and hourly request throttling.
+PR review regressions also cover unchanged split totals without rewrites,
+provisional decreases, morning settling and unchanged-hint revalidation,
+status persistence during API waits, recorder timeout/replay, startup events,
+shutdown cancellation/deferred saves, explicit legacy marker recovery/backoff,
+native today validation, bounded session retention and warning counts,
+no-op status events, and exact compaction accumulation order.
 
-```bash
-pytest ha-integrations/lg-dryer-energy/tests -v
-```
-
-## Coverage
-
-| Brief test # | Covered by |
-|---|---|
-| 1 (normal single-run day) | `test_1_normal_single_run_day` |
-| 2 (unknown-flap does not re-trigger) | `test_2_unknown_flap_does_not_retrigger` |
-| 3 (explicit replay safety) | `test_3_explicit_replay_safety` |
-| 4 (replay with idempotency disabled → identical rows) | `test_4_replay_with_idempotency_bypass_produces_identical_rows` |
-| 5 (no-sessions fallback writes once) | `test_5_no_sessions_fallback_writes_once` |
-| 6 (midnight-crossing session) | `test_6_midnight_crossing_session` |
-| 8 (in-progress session at attribution time) | `test_8_in_progress_session_at_attribution_time` |
-| Regression — non-monotonic sum on replay | `test_non_monotonic_sum_never_occurs_on_replay` |
-
-## Not covered by these unit tests
-
-- **Test 7 (gap-day recovery)** — exercised implicitly by the session-GC
-  log-and-drop behavior in `_async_attribute_energy`, but a dedicated test
-  with the stub harness would add little over reading the code.
-- **Test 9 (storage migration v1 → v2)** — requires the real HA `Store`
-  class. Add this in a parallel test module using
-  `pytest-homeassistant-custom-component` if needed.
-
-## Configuration note
-
-`pytest-asyncio` must be configured in asyncio mode. Either add to
-`pyproject.toml`:
-
-```toml
-[tool.pytest.ini_options]
-asyncio_mode = "auto"
-```
-
-or decorate each async test with `@pytest.mark.asyncio` (already done here).
+These tests validate accounting and lifecycle behavior without a running HA
+instance. Full HA/recorder integration and real-device midnight reporting still
+need deployment validation.
