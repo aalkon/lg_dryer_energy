@@ -7,9 +7,22 @@ import logging
 import math
 from datetime import date, datetime, timedelta
 
+import homeassistant.util.dt as dt_util
 from homeassistant.helpers.entity_component import DATA_INSTANCES
 
 _LOGGER = logging.getLogger(__name__)
+YESTERDAY_SETTLE_HOUR = 6
+
+
+def native_energy_entity(hass, entity_id, key):
+    """Require an enabled native LG energy entity for the requested period."""
+    from homeassistant.components.lg_thinq.sensor import ThinQEnergySensorEntity
+
+    component = hass.data.get(DATA_INSTANCES, {}).get("sensor")
+    entity = component.get_entity(entity_id) if component else None
+    if isinstance(entity, ThinQEnergySensorEntity) and entity.entity_description.key == key:
+        return entity
+    return None
 
 
 class YesterdaySource:
@@ -25,25 +38,36 @@ class YesterdaySource:
         self.entity_id = entity_id
         self._day: date | None = None
         self._value: float | None = None
-        self._hint: float | None = None
         self._next_attempt: datetime | None = None
+        self._missing_warned = False
 
     async def async_read(self, day: date, now: datetime, hint: float | None) -> float | None:
-        """Fetch once per date; recheck changed sensor values or retry failures.
+        """Wait until local morning, then revalidate hourly regardless of hint.
 
-        The hint only triggers a query. It is NEVER used as the energy amount.
+        The native hint cannot prove freshness or completeness and is ignored.
         Limit queries to one per hour, including across a midnight rollover.
         """
         if day != self._day:
-            self._day, self._value, self._hint = day, None, None
-        if self._value is not None and (hint is None or hint == self._hint):
-            return self._value
+            self._day, self._value = day, None
+        local_now = dt_util.as_local(now)
+        settle = datetime.combine(day + timedelta(days=1), datetime.min.time()).replace(
+            hour=YESTERDAY_SETTLE_HOUR, tzinfo=local_now.tzinfo
+        )
+        if local_now < settle:
+            return None
         if self._next_attempt is not None and now < self._next_attempt:
             return self._value
         component = self.hass.data.get(DATA_INSTANCES, {}).get("sensor")
         entity = component.get_entity(self.entity_id) if component else None
         if entity is None:
+            if not self._missing_warned:
+                _LOGGER.warning(
+                    "LG yesterday entity %s is missing or disabled; check energy_yesterday_entity",
+                    self.entity_id,
+                )
+                self._missing_warned = True
             return self._value  # The native integration may still be loading.
+        self._missing_warned = False
         self._next_attempt = now + timedelta(hours=1)
         try:
             # Import lazily so a missing LG integration does not disable today.
@@ -65,7 +89,6 @@ class YesterdaySource:
                     detail=True,
                 )
             self._value = daily_wh(rows, day, entity.property_id)
-            self._hint = hint
         except Exception:
             _LOGGER.warning(
                 "Could not verify LG energy for %s; retaining prior attribution", day, exc_info=True

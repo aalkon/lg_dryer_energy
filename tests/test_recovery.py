@@ -17,50 +17,12 @@ if _PKG_ROOT not in sys.path:
     sys.path.insert(0, _PKG_ROOT)
 
 import lg_dryer_energy as ldy
-from lg_dryer_energy import (
-    DryerSessionTracker,
-)
 
 # ---- helpers ---------------------------------------------------------------
 
 
-def _make_tracker() -> DryerSessionTracker:
-    hass = make_hass()
-    hass.states.get.return_value = None
-    tracker = DryerSessionTracker(
-        hass,
-        status_entity="sensor.dryer_current_status",
-        energy_yesterday_entity="sensor.dryer_energy_yesterday",
-        active_states=["running", "cooling"],
-    )
-    # Skip async_start; we set minimal state directly.
-    tracker._store._data = None
-    return tracker
-
-
 def _freeze_now(monkeypatch, now_utc: datetime) -> None:
     monkeypatch.setattr(ldy.dt_util, "utcnow", lambda: now_utc)
-
-
-def _set_stats_rows(reset_stat_state, rows: dict[str, list[dict]]) -> None:
-    """Install a stub statistics_during_period on the lg_dryer_energy module.
-
-    Because lg_dryer_energy does `from ... import statistics_during_period`,
-    the name is bound at import time and we must patch THAT binding, not the
-    source module's attribute.
-    """
-    reset_stat_state._stats_rows = rows
-
-    def _spd(hass, start_time, end_time, statistic_ids, period, units, types):
-        return rows
-
-    ldy.statistics_during_period = _spd
-
-
-def _event(new_state_val, old_state_val=None):
-    new_state = SimpleNamespace(state=new_state_val) if new_state_val is not None else None
-    old_state = SimpleNamespace(state=old_state_val) if old_state_val is not None else None
-    return ldy.Event({"new_state": new_state, "old_state": old_state})
 
 
 @pytest.mark.asyncio

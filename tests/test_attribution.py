@@ -47,6 +47,7 @@ def env(monkeypatch, reset_stat_state):
     monkeypatch.setattr(integration.dt_util, "_LOCAL_TZ", NY)
     values = {}
     hass = make_hass(running=True)
+    add_lg_entity(hass, "sensor.dryer_energy_today", key="today")
     hass.states.get.side_effect = values.get
     hass.async_create_task = asyncio.create_task
     tracker = integration.DryerSessionTracker(
@@ -602,7 +603,7 @@ async def test_status_time_survives_lock_delay_across_midnight(env, transition):
 async def test_cached_midnight_zero_cannot_erase_prior_energy(env, response):
     today(env, 543)
     await env.tracker._async_refresh()
-    env.now[0] = dt("2026-10-09T00:01:00-04:00")
+    env.now[0] = dt("2026-10-09T06:01:00-04:00")
     # An ordinary coordinator publication advances last_reported, without fetching energy.
     env.values["sensor.dryer_energy_yesterday"] = state(0, env.now[0].isoformat())
     entity = add_lg_entity(env.hass)
@@ -630,3 +631,251 @@ async def test_failed_yesterday_check_does_not_block_today(env):
     today(env, 543)
     await env.tracker._async_refresh()
     assert list(sums(env).values())[-1] == pytest.approx(0.543)
+
+
+@pytest.mark.parametrize("total", [1341, 21, 369, 757])
+@pytest.mark.parametrize("final", [False, True])
+@pytest.mark.asyncio
+async def test_unchanged_split_totals_do_not_rewrite(env, monkeypatch, total, final):
+    env.tracker._sessions.append(session("2026-10-08T09:00:00-04:00", "2026-10-08T09:17:00-04:00"))
+    await env.tracker._async_record("2026-10-08", total, final=final)
+    original = deepcopy(env.tracker._ledger)
+    save = AsyncMock(wraps=env.tracker._store.async_save)
+    monkeypatch.setattr(env.tracker._store, "async_save", save)
+    for _ in range(10):
+        await env.tracker._async_record("2026-10-08", total, final=final)
+    assert env.tracker._ledger == original
+    assert len(env.db._added_calls) == 1
+    save.assert_not_awaited()
+
+
+@pytest.mark.parametrize("drop", [0, 1000])
+@pytest.mark.asyncio
+async def test_today_decrease_preserves_each_cycles_allocation(env, drop):
+    today(env, 543)
+    await env.tracker._async_refresh()
+    env.tracker._sessions.append(session("2026-10-08T14:00:00-04:00", "2026-10-08T14:30:00-04:00"))
+    today(env, 1543)
+    await env.tracker._async_refresh()
+    original = deepcopy(hours(env))
+    for value in (drop, 1543):
+        today(env, value)
+        await env.tracker._async_refresh()
+    assert hours(env) == original
+    assert len(env.db._added_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_status_persists_while_lg_request_waits(env):
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def read(*args):
+        entered.set()
+        await release.wait()
+
+    env.verified.side_effect = read
+    env.tracker._queue_refresh()
+    await entered.wait()
+    await asyncio.wait_for(
+        env.tracker._async_on_status_change(
+            integration.Event({"new_state": state("running", env.now[0].isoformat())})
+        ),
+        1,
+    )
+    assert env.tracker._store._data["current_session_start"] is not None
+    release.set()
+    await env.tracker._refresh_task
+
+
+@pytest.mark.asyncio
+async def test_recorder_timeout_preserves_dirty_intent_for_retry(env, monkeypatch):
+    recorder = integration.get_instance(env.hass)
+    original = recorder.async_block_till_done
+    monkeypatch.setattr(integration, "RECORDER_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(recorder, "async_block_till_done", asyncio.Event().wait)
+    today(env, 543)
+    await asyncio.wait_for(env.tracker._async_refresh(), 1)
+    assert env.tracker._store._data["ledger"]["dirty"]
+    await asyncio.wait_for(
+        env.tracker._async_on_status_change(
+            integration.Event({"new_state": state("running", env.now[0].isoformat())})
+        ),
+        1,
+    )
+    monkeypatch.setattr(recorder, "async_block_till_done", original)
+    await env.tracker._refresh_task
+    assert not env.tracker._ledger["dirty"]
+    assert list(sums(env).values())[-1] == pytest.approx(0.543)
+
+
+@pytest.mark.asyncio
+async def test_missing_marker_scans_hourly_and_logs_once(env, monkeypatch, caplog):
+    env.db._stats_rows[integration.STATISTIC_ID] = [
+        {"start": dt("2026-10-07T12:00:00+00:00").timestamp(), "sum": 100}
+    ]
+    query = MagicMock(wraps=integration.statistics_during_period)
+    monkeypatch.setattr(integration, "statistics_during_period", query)
+    today(env, 543)
+    for _ in range(10):
+        await env.tracker._async_refresh()
+    assert query.call_count == 1
+    env.now[0] = dt("2026-10-08T10:38:00-04:00")
+    await env.tracker._async_refresh()
+    assert query.call_count == 2
+    assert caplog.text.count("no migration marker") == 1
+    assert not env.db._added_calls
+
+
+@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.asyncio
+async def test_explicit_migration_marker_recovers_legacy_storage(env, version):
+    env.db._stats_rows[integration.STATISTIC_ID] = [
+        {"start": dt("2026-10-07T12:00:00+00:00").timestamp(), "sum": 100}
+    ]
+    tracker = integration.DryerSessionTracker(
+        env.hass,
+        env.tracker.status_entity,
+        env.tracker.energy_yesterday_entity,
+        ["running"],
+        migration_last_processed_date="2026-10-07",
+    )
+    tracker._store._data = await tracker._store._async_migrate_func(
+        version, 1, {"sessions": env.tracker._sessions}
+    )
+    tracker._yesterday_source.async_read = AsyncMock(return_value=1000)
+    today(env, 543)
+    await tracker.async_start()
+    await tracker._refresh_task
+    assert list(sums(env).values())[-1] == pytest.approx(100.543)
+    assert tracker._store._data["last_processed_local_date"] == "2026-10-07"
+    await tracker.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_status_change_during_startup_save_is_delivered(env, monkeypatch):
+    handlers = []
+    monkeypatch.setattr(
+        integration,
+        "async_track_state_change_event",
+        lambda hass, entities, handler: handlers.append(handler) or (lambda: None),
+    )
+    env.values[env.tracker.status_entity] = state("end", env.now[0].isoformat())
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = env.tracker._store.async_save
+
+    async def save(data):
+        entered.set()
+        await release.wait()
+        await original(data)
+
+    monkeypatch.setattr(env.tracker._store, "async_save", save)
+    startup = asyncio.create_task(env.tracker.async_start())
+    await entered.wait()
+    assert handlers
+    event = integration.Event({"new_state": state("running", env.now[0].isoformat())})
+    transition = asyncio.create_task(handlers[0](event))
+    await asyncio.sleep(0)
+    release.set()
+    await startup
+    await transition
+    await env.tracker._refresh_task
+    assert env.tracker._store._data["current_session_start"] == env.now[0].isoformat()
+    await env.tracker.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_sessions_pruned_without_energy_and_invalid_warned_once(env, caplog):
+    env.tracker._sessions.extend(
+        [
+            session("2026-09-01T08:00:00-04:00", "2026-09-01T08:30:00-04:00"),
+            session("2026-10-05T08:00:00-04:00", "2026-10-07T08:00:00-04:00"),
+        ]
+    )
+    for _ in range(3):
+        await env.tracker._async_refresh()
+    assert len(env.tracker._sessions) == 1
+    assert len(env.tracker._store._data["sessions"]) == 1
+    assert caplog.text.count("Ignoring implausible") == 1
+    assert not env.db._added_calls
+
+
+@pytest.mark.parametrize(
+    "active,status", [(False, "end"), (False, "power_off"), (True, "running"), (True, "cooling")]
+)
+@pytest.mark.asyncio
+async def test_unchanged_status_does_not_save_or_refresh(env, monkeypatch, active, status):
+    if active:
+        env.tracker._current_session_start = env.now[0]
+    save = AsyncMock()
+    monkeypatch.setattr(env.tracker, "_async_save", save)
+    await env.tracker._async_on_status_change(
+        integration.Event({"new_state": state(status, env.now[0].isoformat())})
+    )
+    save.assert_not_awaited()
+    assert env.tracker._refresh_task is None
+
+
+@pytest.mark.parametrize("key", [None, "yesterday"])
+@pytest.mark.asyncio
+async def test_today_requires_native_today_entity(env, key):
+    if key is None:
+        env.hass.data["entity_components"]["sensor"].entities["sensor.dryer_energy_today"] = (
+            SimpleNamespace()
+        )
+    else:
+        add_lg_entity(env.hass, "sensor.dryer_energy_today", key=key)
+    today(env, 543)
+    await env.tracker._async_refresh()
+    assert not env.db._added_calls
+
+
+@pytest.mark.asyncio
+async def test_shutdown_during_intent_save_retains_update_without_import(env, monkeypatch):
+    deferred = []
+
+    async def defer_save(data):
+        env.hass.state = integration.CoreState.stopping
+        deferred.append(deepcopy(data))
+
+    monkeypatch.setattr(env.tracker._store, "async_save", defer_save)
+    today(env, 543)
+    await env.tracker._async_refresh()
+    assert env.tracker._ledger["dirty"]
+    assert not env.db._added_calls
+    await env.tracker.async_stop()
+    assert deferred[-1]["ledger"]["days"]["2026-10-08"]["total_wh"] == 543
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_stuck_refresh_and_saves(env):
+    entered = asyncio.Event()
+
+    async def read(*args):
+        entered.set()
+        await asyncio.Event().wait()
+
+    env.verified.side_effect = read
+    env.tracker._queue_refresh()
+    await entered.wait()
+    await asyncio.wait_for(env.tracker.async_stop(), 1)
+    assert env.tracker._refresh_task.cancelled()
+    assert env.tracker._store._data is not None
+
+
+def test_compaction_matches_recorders_exact_accumulation_order():
+    ledger = {
+        "anchor": "2026-09-01T00:00:00+00:00",
+        "base_sum": 2.56,
+        "legacy_hours": {},
+        "days": {},
+        "written_hours": [],
+    }
+    for day in range(19, 0, -1):
+        ledger["days"][f"2026-09-{day:02d}"] = {
+            "hours": {f"2026-09-{day:02d}T12:00:00+00:00": day / 1000}
+        }
+    expected = ledger["base_sum"]
+    for _, value in sorted(combined_hours(ledger).items()):
+        expected += value
+    compact(ledger, dt("2026-09-20T00:00:00+00:00"))
+    assert ledger["base_sum"] == expected

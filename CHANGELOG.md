@@ -2,6 +2,10 @@
 
 ## 0.2.0 - 2026-10-08
 
+- Address PR review: avoid unchanged-total and no-op status writes, ignore provisional decreases, validate the native today source, and match compaction rounding to recorder accumulation.
+- Defer yesterday reconciliation until 6 AM local time and revalidate hourly even with an unchanged native value. Warn once when the configured yesterday entity is missing.
+- Capture status changes during startup, release the session lock during LG requests, bound recorder waits, and preserve deferred accounting writes during shutdown.
+- Add explicit `migration_last_processed_date` recovery for legacy storage without a marker, with hourly retry and a single diagnostic. Prune sessions independently of successful attribution and discard invalid sessions once.
 - Fix review findings: defer imports until HA has started, verify atomic accounting writes by reading the storage file, and preserve status-event timestamps through lock delays.
 - Verify yesterday through a read-only, date-specific detailed LG API response using the native entity's existing connection. Cached state timestamps cannot establish a reporting date. Missing or mismatched rows never become zero corrections; retry/recheck requests are capped at once an hour per running instance.
 - Use the optional `energy_today_entity` (default `sensor.dryer_energy_today`) for provisional same-day energy estimates after a cycle completes. Missing or unusable today data falls back to yesterday-only attribution.

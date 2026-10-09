@@ -6,8 +6,9 @@ import asyncio
 import json
 import logging
 import math
+from contextlib import suppress
 from copy import deepcopy
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +29,7 @@ from homeassistant.helpers.start import async_at_started
 from homeassistant.helpers.storage import Store
 
 from .ledger import combined_hours, compact, hour_key, timestamp, update_day
-from .source import YesterdaySource
+from .source import YesterdaySource, native_energy_entity
 
 _LOGGER = logging.getLogger(__name__)
 DOMAIN = "lg_dryer_energy"
@@ -36,6 +37,7 @@ STATISTIC_ID = f"{DOMAIN}:dryer_energy_attributed"
 STORAGE_KEY = f"{DOMAIN}.sessions"
 STORAGE_VERSION = 3
 SESSION_RETENTION_DAYS = 14
+RECORDER_TIMEOUT_SECONDS = 30
 _NON_NUMERIC_STATES = frozenset({"unknown", "unavailable", "none", ""})
 DEFAULT_STATUS_ENTITY = "sensor.dryer_current_status"
 DEFAULT_ENERGY_YESTERDAY_ENTITY = "sensor.dryer_energy_yesterday"
@@ -56,6 +58,7 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         total_time_entity=conf.get("total_time_entity", DEFAULT_TOTAL_TIME_ENTITY),
         remaining_time_entity=conf.get("remaining_time_entity", DEFAULT_REMAINING_TIME_ENTITY),
         energy_today_entity=conf.get("energy_today_entity", DEFAULT_ENERGY_TODAY_ENTITY),
+        migration_last_processed_date=conf.get("migration_last_processed_date"),
     )
     await tracker.async_start()
     hass.data[DOMAIN] = tracker
@@ -71,7 +74,11 @@ class _LgDryerStore(Store):
         """
         snapshot = deepcopy(data)
         await self.async_save(snapshot)
+        if self.hass.state is CoreState.stopping:
+            return  # HA will persist the intent at its final-write event.
         saved = await self.hass.async_add_executor_job(self._read_saved_data)
+        if self.hass.state is CoreState.stopping:
+            return
         if (
             saved.get("version") != self.version
             or saved.get("key") != self.key
@@ -115,6 +122,7 @@ class DryerSessionTracker:
         total_time_entity=DEFAULT_TOTAL_TIME_ENTITY,
         remaining_time_entity=DEFAULT_REMAINING_TIME_ENTITY,
         energy_today_entity=DEFAULT_ENERGY_TODAY_ENTITY,
+        migration_last_processed_date=None,
     ):
         self.hass = hass
         self.status_entity = status_entity
@@ -123,6 +131,13 @@ class DryerSessionTracker:
         self.active_states = [s.lower() for s in active_states]
         self.total_time_entity = total_time_entity
         self.remaining_time_entity = remaining_time_entity
+        self._migration_date = (
+            date.fromisoformat(str(migration_last_processed_date)).isoformat()
+            if migration_last_processed_date is not None
+            else None
+        )
+        self._migration_retry_at = None
+        self._migration_warned = False
         self._store = _LgDryerStore(hass, STORAGE_VERSION, STORAGE_KEY, atomic_writes=True)
         self._yesterday_source = YesterdaySource(hass, energy_yesterday_entity)
         self._sessions: list[dict] = []
@@ -130,6 +145,7 @@ class DryerSessionTracker:
         self._last_processed_local_date: str | None = None
         self._ledger: dict | None = None
         self._lock = asyncio.Lock()
+        self._refresh_lock = asyncio.Lock()
         self._unsubscribers = []
         self._refresh_task = None
         self._stopped = False
@@ -139,26 +155,36 @@ class DryerSessionTracker:
         self._sessions = stored.get("sessions", [])
         self._last_processed_local_date = stored.get("last_processed_local_date")
         self._ledger = stored.get("ledger")
+        if self._ledger is None and not self._last_processed_local_date:
+            self._last_processed_local_date = self._migration_date
         if start := stored.get("current_session_start"):
             self._current_session_start = timestamp(start)
 
-        state = self.hass.states.get(self.status_entity)
-        if state and state.state.lower() in self.active_states:
-            if self._current_session_start is None:
-                now = dt_util.utcnow()
-                self._current_session_start = (
-                    self._resume_from_lg_sensors(now)
-                    or await self._async_reconstruct_session_start()
-                    or now
+        async with self._lock:
+            # Subscribe before any snapshot-related await; queued events retain
+            # their original timestamps and run after initialization finishes.
+            self._unsubscribers.append(
+                async_track_state_change_event(
+                    self.hass, [self.status_entity], self._async_on_status_change
                 )
-        elif state and state.state.lower() not in _NON_NUMERIC_STATES:
-            self._close_session(getattr(state, "last_changed", dt_util.utcnow()))
-        await self._async_save()
-        self._unsubscribers.append(
-            async_track_state_change_event(
-                self.hass, [self.status_entity], self._async_on_status_change
             )
-        )
+            try:
+                state = self.hass.states.get(self.status_entity)
+                if state and state.state.lower() in self.active_states:
+                    if self._current_session_start is None:
+                        now = dt_util.utcnow()
+                        self._current_session_start = (
+                            self._resume_from_lg_sensors(now)
+                            or await self._async_reconstruct_session_start()
+                            or now
+                        )
+                elif state and state.state.lower() not in _NON_NUMERIC_STATES:
+                    self._close_session(getattr(state, "last_changed", dt_util.utcnow()))
+                self._prune_sessions()
+                await self._async_save()
+            except BaseException:
+                self._unsubscribers.pop()()
+                raise
         energy_entities = [self.energy_yesterday_entity]
         if self.energy_today_entity:
             energy_entities.append(self.energy_today_entity)
@@ -181,7 +207,9 @@ class DryerSessionTracker:
             unsubscribe()
         self._unsubscribers.clear()
         if self._refresh_task:
-            await self._refresh_task
+            self._refresh_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._refresh_task
         async with self._lock:
             # HA defers Store writes during shutdown until its final-write event.
             await self._async_save(verify=False)
@@ -199,9 +227,30 @@ class DryerSessionTracker:
         if self._current_session_start is None:
             return
         start = self._current_session_start
-        if end > start:
+        if timedelta(0) < end - start <= timedelta(days=1):
             self._sessions.append({"start": start.isoformat(), "end": end.isoformat()})
+        else:
+            _LOGGER.warning("Ignoring implausible dryer session: %s to %s", start, end)
         self._current_session_start = None
+        self._prune_sessions()
+
+    def _prune_sessions(self):
+        """Bound history even when no energy can be attributed; warn only once."""
+        cutoff = dt_util.utcnow() - timedelta(days=SESSION_RETENTION_DAYS)
+        retained = []
+        for session in self._sessions:
+            try:
+                start, end = timestamp(session["start"]), timestamp(session["end"])
+                if not timedelta(0) < end - start <= timedelta(days=1):
+                    raise ValueError("Invalid session duration")
+            except (KeyError, TypeError, ValueError):
+                _LOGGER.warning("Ignoring implausible dryer session: %s", session)
+                continue
+            if end >= cutoff:
+                retained.append(session)
+        changed = retained != self._sessions
+        self._sessions = retained
+        return changed
 
     async def _async_on_status_change(self, event: Event):
         state = event.data.get("new_state")
@@ -211,33 +260,46 @@ class DryerSessionTracker:
         if not isinstance(changed, datetime):
             changed = dt_util.utcnow()
         async with self._lock:
+            previous_start = self._current_session_start
             if state.state.lower() in self.active_states:
                 if self._current_session_start is None:
                     self._current_session_start = changed
             else:
                 self._close_session(changed)
+            if self._current_session_start == previous_start:
+                return
             await self._async_save()
         self._queue_refresh()
 
     async def _async_refresh(self):
+        # Keep source reads serialized, without blocking status persistence.
+        async with self._refresh_lock:
+            await self._async_refresh_once()
+
+    async def _async_refresh_once(self):
         if self._stopped or self.hass.state is not CoreState.running:
             return
+        now = dt_util.utcnow()
+        yesterday = (dt_util.as_local(now) - timedelta(days=1)).date()
+        value = await self._yesterday_source.async_read(
+            yesterday, now, _energy_wh(self.hass.states.get(self.energy_yesterday_entity))
+        )
         async with self._lock:
+            if self._stopped or self.hass.state is not CoreState.running:
+                return
             try:
+                if self._prune_sessions():
+                    await self._async_save()
                 if self._ledger and self._ledger.get("dirty"):
                     await self._async_flush()
-                now = dt_util.utcnow()
-                local_now = dt_util.as_local(now)
-                yesterday = (local_now - timedelta(days=1)).date()
-                value = await self._yesterday_source.async_read(
-                    yesterday, now, _energy_wh(self.hass.states.get(self.energy_yesterday_entity))
-                )
+                local_now = dt_util.as_local(dt_util.utcnow())
                 if value is not None:
                     await self._async_record(yesterday.isoformat(), value, final=True)
 
                 state = (
                     self.hass.states.get(self.energy_today_entity)
                     if self.energy_today_entity
+                    and native_energy_entity(self.hass, self.energy_today_entity, "today")
                     else None
                 )
                 value = _energy_wh(state)
@@ -263,7 +325,6 @@ class DryerSessionTracker:
                 continue
             start, end = timestamp(session["start"]), timestamp(session["end"])
             if end <= start or end - start > timedelta(days=1):
-                _LOGGER.warning("Ignoring implausible dryer session: %s", session)
                 continue
             if dt_util.as_local(end).date().isoformat() == day:
                 result.append({"start": start.isoformat(), "end": end.isoformat()})
@@ -279,7 +340,8 @@ class DryerSessionTracker:
         if self._ledger is None:
             if total_wh == 0:
                 return
-            await self._async_initialize_ledger()
+            if not await self._async_initialize_ledger():
+                return
         local_now = dt_util.as_local(dt_util.utcnow())
         noon = datetime.fromisoformat(day).replace(hour=12, tzinfo=local_now.tzinfo)
         previous = self._ledger["days"].get(day)
@@ -301,7 +363,8 @@ class DryerSessionTracker:
         except Exception:
             self._ledger = old
             raise
-        await self._async_flush()
+        if self.hass.state is CoreState.running and not self._stopped:
+            await self._async_flush()
 
     async def _async_read_statistics(self, start, end=None):
         return (
@@ -320,11 +383,21 @@ class DryerSessionTracker:
     async def _async_initialize_ledger(self):
         # One-time migration includes arbitrarily long gaps. A failed query
         # must never reset an existing cumulative series to zero.
-        rows = await self._async_read_statistics(datetime(1970, 1, 1, tzinfo=UTC))
+        now = dt_util.utcnow()
+        if self._migration_retry_at and now < self._migration_retry_at:
+            return False
+        self._migration_retry_at = now + timedelta(hours=1)
+        async with asyncio.timeout(RECORDER_TIMEOUT_SECONDS):
+            rows = await self._async_read_statistics(datetime(1970, 1, 1, tzinfo=UTC))
         if rows and not self._last_processed_local_date:
-            raise RuntimeError(
-                "Existing statistics but no migration marker; restore the integration's storage before continuing"
-            )
+            if not self._migration_warned:
+                _LOGGER.error(
+                    "Existing dryer statistics have no migration marker; restore matching storage "
+                    "or configure migration_last_processed_date (see README recovery instructions). "
+                    "Attribution is paused; retrying hourly."
+                )
+                self._migration_warned = True
+            return False
         anchor = hour_key(dt_util.utcnow() - timedelta(days=SESSION_RETENTION_DAYS + 2))
         base_sum = previous = 0.0
         legacy = {}
@@ -346,6 +419,8 @@ class DryerSessionTracker:
             "written_hours": list(legacy),
             "dirty": False,
         }
+        self._migration_retry_at = None
+        return True
 
     async def _async_flush(self):
         ledger = self._ledger
@@ -369,20 +444,18 @@ class DryerSessionTracker:
             },
             statistics,
         )
-        await get_instance(self.hass).async_block_till_done()
-        actual = {
-            row["start"]: row.get("sum")
-            for row in await self._async_read_statistics(anchor - timedelta(hours=1))
-        }
+        async with asyncio.timeout(RECORDER_TIMEOUT_SECONDS):
+            await get_instance(self.hass).async_block_till_done()
+            actual = {
+                row["start"]: row.get("sum")
+                for row in await self._async_read_statistics(anchor - timedelta(hours=1))
+            }
         for row in statistics:
             value = actual.get(row["start"].timestamp())
             if value is None or not math.isclose(value, row["sum"], abs_tol=1e-8):
                 raise RuntimeError("Recorder has not committed the expected dryer statistics")
         ledger["dirty"] = False
-        cutoff = dt_util.utcnow() - timedelta(days=SESSION_RETENTION_DAYS)
-        self._sessions = [
-            s for s in self._sessions if s.get("end") and timestamp(s["end"]) >= cutoff
-        ]
+        self._prune_sessions()
         await self._async_save()
 
     async def _async_save(self, *, verify=True):

@@ -55,6 +55,9 @@ def update_day(
     previous = previous or {}
     if previous.get("final") and not final:
         return previous
+    # Only verified yesterday data may revise a day's amount downward.
+    if not final and total_wh < previous.get("total_wh", 0):
+        return previous
     old = dict(previous.get("hours", {}))
     old_total = sum(old.values())
     total = total_wh / 1000
@@ -63,6 +66,13 @@ def update_day(
         s for s in sessions if cursor is None or timestamp(s["end"]) > timestamp(cursor)
     ]
     synthetic = previous.get("synthetic", False)
+    if (
+        total_wh == previous.get("total_wh")
+        and final == previous.get("final")
+        and not new_sessions
+        and not (synthetic and sessions)
+    ):
+        return previous  # Avoid floating-point drift and repeated recorder writes.
     if old_total == 0:
         new_sessions = sessions
 
@@ -77,7 +87,8 @@ def update_day(
             old[key] = old.get(key, 0.0) + value
         cursor = max(s["end"] for s in sessions)
     elif old_total > 0:
-        old = {key: value * total / old_total for key, value in old.items()}
+        if total_wh != previous.get("total_wh"):
+            old = {key: value * total / old_total for key, value in old.items()}
     elif total > 0 and final:
         old = {hour_key(fallback): total}
         synthetic = True
@@ -134,7 +145,10 @@ def compact(ledger: dict, cutoff: datetime) -> None:
     if key <= ledger["anchor"]:
         return
     hours = combined_hours(ledger)
-    ledger["base_sum"] += sum(value for hour, value in hours.items() if hour < key)
+    # Match recorder's chronological accumulation exactly, including rounding.
+    for hour in sorted(hours):
+        if hour < key:
+            ledger["base_sum"] += hours[hour]
     ledger["legacy_hours"] = {
         hour: value for hour, value in ledger["legacy_hours"].items() if hour >= key
     }

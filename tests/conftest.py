@@ -208,17 +208,19 @@ class ThinQEnergySensorEntity:
 _lg_sensor_mod.ThinQEnergySensorEntity = ThinQEnergySensorEntity
 
 
-def add_lg_entity(hass, entity_id="sensor.dryer_energy_yesterday"):
+def add_lg_entity(hass, entity_id="sensor.dryer_energy_yesterday", *, key="yesterday"):
     """Expose the same entity -> coordinator -> SDK path as native LG."""
     entity = ThinQEnergySensorEntity()
-    entity.entity_description = types.SimpleNamespace(key="yesterday", usage_period="DAILY")
+    entity.entity_description = types.SimpleNamespace(key=key, usage_period="DAILY")
     entity.property_id = "energyUsage"
     entity.coordinator = types.SimpleNamespace(
         api=types.SimpleNamespace(async_get_energy_usage=AsyncMock(return_value=[]))
     )
-    component = MagicMock()
-    component.get_entity.side_effect = lambda key: entity if key == entity_id else None
-    hass.data["entity_components"] = {"sensor": component}
+    components = hass.data.setdefault("entity_components", {})
+    if "sensor" not in components:
+        components["sensor"] = types.SimpleNamespace(entities={})
+        components["sensor"].get_entity = MagicMock(side_effect=components["sensor"].entities.get)
+    components["sensor"].entities[entity_id] = entity
     return entity
 
 
